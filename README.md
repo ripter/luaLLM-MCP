@@ -35,6 +35,47 @@ make run
 uv run python mcp_server.py
 ```
 
+The server uses stdio transport for MCP communication. It will print startup info and then wait for requests from an MCP client.
+
+## Manual Testing
+
+Test that the server initializes correctly:
+
+```bash
+uv run python -c "
+import asyncio
+from mcp import StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp import ClientSession
+
+async def test():
+    params = StdioServerParameters(command='uv', args=['run', 'python', 'mcp_server.py'])
+    async with stdio_client(params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print(f'Found {len(tools.tools)} tools:')
+            for t in tools.tools:
+                print(f'  - {t.name}')
+
+asyncio.run(test())
+"
+```
+
+Expected output:
+```
+Found 9 tools:
+  - list_models
+  - get_model_info
+  - get_server_status
+  - get_capabilities
+  - acquire_model
+  - release_model
+  - get_model_logs
+  - health_check
+  - list_leases
+```
+
 ## MCP Tools
 
 | Tool | Description |
