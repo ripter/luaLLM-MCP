@@ -54,6 +54,133 @@ def _error_detail(resp: dict) -> str:
     return " | ".join(parts)
 
 
+def _find_running_server(model_name: str) -> dict | None:
+    """Look up a running luallm server for the model, or None."""
+    status_resp = client.get_server_status()
+    if not status_resp["success"]:
+        return None
+    for srv in status_resp.get("data", {}).get("servers", []):
+        if srv.get("model") == model_name and srv.get("state") == "running":
+            return srv
+    return None
+
+
+def _handle_acquire(model_name: str | None, preset: str | None,
+                    client_id: str | None, purpose: str | None) -> dict:
+    """acquire_model: reuse an MCP-managed instance, adopt an externally
+    started one (never stopped on release), or start the model."""
+    if not model_name:
+        return {"success": False, "error": "MISSING_MODEL_NAME"}
+
+    models_resp = client.list_models()
+    if not models_resp["success"]:
+        return {"success": False, "error": "CANNOT_LIST_MODELS"}
+    if model_name not in [m.get("name") for m in models_resp.get("data", [])]:
+        return {"success": False, "error": "MODEL_NOT_FOUND"}
+
+    def lease_data(instance, lease, reused: bool, pid=None) -> dict:
+        data = {
+            "instance_id": instance.instance_id,
+            "lease_id": lease.lease_id,
+            "model": model_name,
+            "preset": preset,
+            "port": instance.port,
+            "reused": reused,
+            "external": not instance.managed_by_mcp,
+        }
+        if pid is not None:
+            data["pid"] = pid
+        return data
+
+    instance = lease_manager.find_instance(model_name, preset)
+    running = _find_running_server(model_name)
+
+    if instance:
+        if running is None:
+            # Stale record: the server behind it is gone (stopped or
+            # crashed outside MCP). Drop it and start fresh below.
+            logger.info(f"Dropping stale instance record for {model_name}")
+            lease_manager.remove_instance(instance.instance_id)
+            instance = None
+        else:
+            # Trust live status over the record (server may have moved ports).
+            port = running.get("port")
+            instance.port = int(port) if port is not None else instance.port
+            instance, lease = lease_manager.acquire_lease(model_name, preset, client_id, purpose)
+            return {"success": True, "data": lease_data(instance, lease, reused=True)}
+
+    if running:
+        # Started outside the MCP (e.g. `luallm start` in a terminal).
+        # Adopt it so workflows can use it; release will not stop it.
+        if preset:
+            return {
+                "success": False,
+                "error": (f"MODEL_RUNNING_EXTERNALLY: {model_name} is already running outside "
+                          f"MCP management, so the '{preset}' preset cannot be applied. "
+                          f"Acquire without a preset to use it, or stop it first."),
+            }
+        port = running.get("port")
+        instance, lease = lease_manager.acquire_lease(
+            model_name, preset, client_id, purpose,
+            port=int(port) if port is not None else None,
+            managed_by_mcp=False)
+        logger.info(f"Adopted externally started instance of {model_name}")
+        return {"success": True, "data": lease_data(instance, lease, reused=True)}
+
+    start_resp = client.start_model(model_name, preset)
+    if not start_resp["success"]:
+        return {"success": False, "error": _error_detail(start_resp)}
+    data = start_resp.get("data", {})
+    port = data.get("port")
+    instance, lease = lease_manager.acquire_lease(
+        model_name, preset, client_id, purpose,
+        port=int(port) if port is not None else None)
+    return {"success": True, "data": lease_data(instance, lease, reused=False, pid=data.get("pid"))}
+
+
+def _handle_release(lease_id: str | None) -> dict:
+    """release_model: drop the lease; stop the model when this was the last
+    lease on an MCP-managed instance. A failed stop is an error, not a
+    warning — otherwise models silently pile up."""
+    if not lease_id:
+        return {"success": False, "error": "MISSING_LEASE_ID"}
+    release_result = lease_manager.release_lease(lease_id)
+    if not release_result["success"]:
+        return {"success": False, "error": release_result.get("error", "RELEASE_FAILED")}
+
+    stopped = False
+    if release_result.get("instance_stopped"):
+        stop_resp = client.stop_model(release_result["model"])
+        if stop_resp["success"]:
+            stopped = True
+        else:
+            return {
+                "success": False,
+                "error": (f"LEASE_RELEASED_BUT_STOP_FAILED: the lease was released but "
+                          f"{release_result['model']} could not be stopped: {_error_detail(stop_resp)}"),
+                "data": {**release_result, "stopped": False},
+            }
+    return {"success": True, "data": {**release_result, "stopped": stopped}}
+
+
+def _handle_force_stop(model_name: str | None) -> dict:
+    """force_stop_model: stop a model regardless of leases and purge its
+    instance/lease records. The escape hatch for orphaned models."""
+    if not model_name:
+        return {"success": False, "error": "MISSING_MODEL_NAME"}
+    removed = lease_manager.remove_model_records(model_name)
+    stop_resp = client.stop_model(model_name)
+    if not stop_resp["success"]:
+        return {
+            "success": False,
+            "error": f"STOP_FAILED: {_error_detail(stop_resp)}",
+            "data": {"model": model_name, "stopped": False, **removed},
+        }
+    logger.info(f"Force-stopped {model_name} "
+                f"(removed {removed['removed_leases']} lease(s))")
+    return {"success": True, "data": {"model": model_name, "stopped": True, **removed}}
+
+
 @mcp_server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
@@ -102,6 +229,15 @@ async def handle_list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {"lease_id": {"type": "string", "description": "Lease ID to release"}},
                 "required": ["lease_id"],
+            },
+        ),
+        Tool(
+            name="force_stop_model",
+            description="Stop a model regardless of leases and purge its lease records. Escape hatch for orphaned models.",
+            inputSchema={
+                "type": "object",
+                "properties": {"model_name": {"type": "string", "description": "Model name"}},
+                "required": ["model_name"],
             },
         ),
         Tool(
@@ -166,72 +302,24 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
         result["data"] = {
             "tools": ["list_models", "get_model_info", "get_server_status",
                      "get_capabilities", "acquire_model", "release_model",
-                     "get_model_logs", "health_check", "list_leases"],
+                     "force_stop_model", "get_model_logs", "health_check",
+                     "list_leases"],
             "version": "1.0",
         }
     
     elif name == "acquire_model":
-        model_name = arguments.get("model_name")
-        preset = arguments.get("preset")
-        client_id = arguments.get("client_id")
-        purpose = arguments.get("purpose")
-        
-        if not model_name:
-            result["success"] = False
-            result["error"] = "MISSING_MODEL_NAME"
-        else:
-            models_resp = client.list_models()
-            if not models_resp["success"]:
-                result["success"] = False
-                result["error"] = "CANNOT_LIST_MODELS"
-            elif model_name not in [m.get("name") for m in models_resp.get("data", [])]:
-                result["success"] = False
-                result["error"] = "MODEL_NOT_FOUND"
-            else:
-                instance = lease_manager.find_instance(model_name, preset)
-                if instance:
-                    _, lease = lease_manager.acquire_lease(model_name, preset, client_id, purpose)
-                    result["data"] = {
-                        "instance_id": instance.instance_id,
-                        "lease_id": lease.lease_id,
-                        "model": model_name,
-                        "preset": preset,
-                        "reused": True,
-                    }
-                else:
-                    start_resp = client.start_model(model_name, preset)
-                    if start_resp["success"]:
-                        data = start_resp.get("data", {})
-                        _, lease = lease_manager.acquire_lease(model_name, preset, client_id, purpose)
-                        result["data"] = {
-                            "instance_id": lease.instance_id,
-                            "lease_id": lease.lease_id,
-                            "model": model_name,
-                            "preset": preset,
-                            "pid": data.get("pid"),
-                            "port": data.get("port"),
-                            "reused": False,
-                        }
-                    else:
-                        result["success"] = False
-                        result["error"] = _error_detail(start_resp)
+        result = _handle_acquire(
+            arguments.get("model_name"),
+            arguments.get("preset"),
+            arguments.get("client_id"),
+            arguments.get("purpose"),
+        )
     
     elif name == "release_model":
-        lease_id = arguments.get("lease_id")
-        if not lease_id:
-            result["success"] = False
-            result["error"] = "MISSING_LEASE_ID"
-        else:
-            release_result = lease_manager.release_lease(lease_id)
-            if release_result["success"]:
-                if release_result.get("instance_stopped"):
-                    stop_resp = client.stop_model(release_result["model"])
-                    if not stop_resp["success"]:
-                        logger.warning(f"Failed to stop {release_result['model']}")
-                result["data"] = release_result
-            else:
-                result["success"] = False
-                result["error"] = release_result.get("error", "RELEASE_FAILED")
+        result = _handle_release(arguments.get("lease_id"))
+
+    elif name == "force_stop_model":
+        result = _handle_force_stop(arguments.get("model_name"))
     
     elif name == "get_model_logs":
         instance_id = arguments.get("instance_id")

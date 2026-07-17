@@ -81,6 +81,188 @@ def test_error_detail_never_empty():
     )
 
 
+def _fake_client(models, running=None, start=None, stop_fails=False):
+    servers = list(running or [])
+
+    class FakeClient:
+        stopped = []
+
+        def list_models(self):
+            return {"success": True, "data": [{"name": m} for m in models]}
+
+        def get_server_status(self):
+            return {"success": True, "data": {"servers": servers}}
+
+        def start_model(self, model, preset=None):
+            resp = start or {"success": False, "stderr": "start_model should not be called"}
+            if resp.get("success"):
+                # Mirror reality: a started model shows up in status.
+                servers.append({
+                    "model": model,
+                    "state": "running",
+                    "port": resp.get("data", {}).get("port"),
+                })
+            return resp
+
+        def stop_model(self, model):
+            if stop_fails:
+                return {"success": False, "stderr": "stop exploded"}
+            self.stopped.append(model)
+            servers[:] = [s for s in servers if s.get("model") != model]
+            return {"success": True, "data": {"stopped": True}}
+
+    return FakeClient()
+
+
+def _isolated(monkeypatch, tmp_path, client):
+    import mcp_server
+    import lease_manager
+    monkeypatch.setattr(mcp_server, "lease_manager",
+                        lease_manager.LeaseManager(state_dir=str(tmp_path)))
+    monkeypatch.setattr(mcp_server, "client", client)
+    return mcp_server
+
+
+def test_acquire_adopts_external_instance(monkeypatch, tmp_path):
+    """A model running outside MCP management is adopted: lease + port are
+    returned, and releasing never stops the external server."""
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["ornith"], running=[{"model": "ornith", "state": "running", "port": 8080}]))
+
+    result = mcp_server._handle_acquire("ornith", None, "test", "adopt")
+    assert result["success"] is True
+    assert result["data"]["external"] is True
+    assert result["data"]["reused"] is True
+    assert result["data"]["port"] == 8080
+
+    release = mcp_server.lease_manager.release_lease(result["data"]["lease_id"])
+    assert release["success"] is True
+    assert release["instance_stopped"] is False
+
+
+def test_acquire_external_with_preset_is_refused(monkeypatch, tmp_path):
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["ornith"], running=[{"model": "ornith", "state": "running", "port": 8080}]))
+    result = mcp_server._handle_acquire("ornith", "throughput", "test", "t")
+    assert result["success"] is False
+    assert "MODEL_RUNNING_EXTERNALLY" in result["error"]
+
+
+def test_acquire_reuse_reports_port(monkeypatch, tmp_path):
+    """Second acquire on an MCP-started model must include the port so
+    clients can build the endpoint."""
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}}))
+
+    first = mcp_server._handle_acquire("tiny", None, "test", "t")
+    assert first["success"] is True
+    assert first["data"]["reused"] is False
+    assert first["data"]["port"] == 8081
+
+    second = mcp_server._handle_acquire("tiny", None, "test", "t")
+    assert second["data"]["reused"] is True
+    assert second["data"]["external"] is False
+    assert second["data"]["port"] == 8081
+
+
+def test_acquire_drops_stale_instance_and_restarts(monkeypatch, tmp_path):
+    """A record whose server is no longer running (stopped outside MCP)
+    must be discarded — with its leases — and the model started fresh,
+    instead of handing out a lease on a dead endpoint."""
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["skyfall"], start={"success": True, "data": {"pid": 2, "port": 8083}}))
+    # Stale record with an old port, plus an orphaned lease on it.
+    stale_instance, stale_lease = mcp_server.lease_manager.acquire_lease(
+        "skyfall", None, "old", "old", port=8082)
+
+    result = mcp_server._handle_acquire("skyfall", None, "test", "t")
+    assert result["success"] is True
+    assert result["data"]["reused"] is False
+    assert result["data"]["port"] == 8083
+    assert result["data"]["instance_id"] != stale_instance.instance_id
+    assert mcp_server.lease_manager.find_lease(stale_lease.lease_id) is None
+
+
+def test_acquire_syncs_port_with_live_status(monkeypatch, tmp_path):
+    """If the server moved ports since the record was written, the live
+    port from get_server_status wins."""
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["tiny"], running=[{"model": "tiny", "state": "running", "port": 9091}]))
+    mcp_server.lease_manager.acquire_lease("tiny", None, "old", "old", port=8080)
+
+    result = mcp_server._handle_acquire("tiny", None, "test", "t")
+    assert result["data"]["reused"] is True
+    assert result["data"]["port"] == 9091
+
+
+def test_release_stops_last_lease_and_reports_it(monkeypatch, tmp_path):
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client)
+
+    first = mcp_server._handle_acquire("tiny", None, "a", "t")
+    second = mcp_server._handle_acquire("tiny", None, "b", "t")
+
+    rel1 = mcp_server._handle_release(second["data"]["lease_id"])
+    assert rel1["success"] is True
+    assert rel1["data"]["stopped"] is False
+    assert rel1["data"]["remaining_leases"] == 1
+
+    rel2 = mcp_server._handle_release(first["data"]["lease_id"])
+    assert rel2["success"] is True
+    assert rel2["data"]["stopped"] is True
+    assert client.stopped == ["tiny"]
+
+
+def test_release_surfaces_stop_failures(monkeypatch, tmp_path):
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}}, stop_fails=True))
+    acq = mcp_server._handle_acquire("tiny", None, "a", "t")
+    rel = mcp_server._handle_release(acq["data"]["lease_id"])
+    assert rel["success"] is False
+    assert "STOP_FAILED" in rel["error"]
+    assert "stop exploded" in rel["error"]
+
+
+def test_release_never_stops_external_instances(monkeypatch, tmp_path):
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["ornith"], running=[{"model": "ornith", "state": "running", "port": 8080}]))
+    acq = mcp_server._handle_acquire("ornith", None, "a", "t")
+    assert acq["data"]["external"] is True
+    rel = mcp_server._handle_release(acq["data"]["lease_id"])
+    assert rel["success"] is True
+    assert rel["data"]["stopped"] is False
+    assert rel["data"]["external"] is True
+
+
+def test_force_stop_purges_records_and_stops(monkeypatch, tmp_path):
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client)
+    # Two leases, would normally block stopping.
+    mcp_server._handle_acquire("tiny", None, "a", "t")
+    mcp_server._handle_acquire("tiny", None, "b", "t")
+
+    result = mcp_server._handle_force_stop("tiny")
+    assert result["success"] is True
+    assert result["data"]["stopped"] is True
+    assert result["data"]["removed_leases"] == 2
+    assert client.stopped == ["tiny"]
+    assert mcp_server.lease_manager.list_leases() == []
+
+
+def test_acquire_backfills_port_from_status(monkeypatch, tmp_path):
+    """Instance records created before port tracking get their port from
+    get_server_status on the next acquire."""
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["tiny"], running=[{"model": "tiny", "state": "running", "port": 9090}]))
+    # Simulate a pre-existing record without a port.
+    mcp_server.lease_manager.acquire_lease("tiny", None, "old", "old")
+    assert mcp_server.lease_manager.find_instance("tiny").port is None
+
+    result = mcp_server._handle_acquire("tiny", None, "test", "t")
+    assert result["data"]["reused"] is True
+    assert result["data"]["port"] == 9090
+
+
 def test_lease_manager_imports():
     """Test that lease_manager module can be imported."""
     import lease_manager

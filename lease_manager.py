@@ -142,25 +142,35 @@ class LeaseManager:
     
     def acquire_lease(self, model: str, preset: str | None,
                       client_id: str | None = None,
-                      purpose: str | None = None) -> tuple[Instance, Lease]:
-        """Acquire a lease for a model instance."""
+                      purpose: str | None = None,
+                      port: int | None = None,
+                      managed_by_mcp: bool = True) -> tuple[Instance, Lease]:
+        """Acquire a lease for a model instance.
+
+        port/managed_by_mcp describe the instance when a new record is
+        created: managed_by_mcp=False adopts an externally started server,
+        which release_lease will never stop.
+        """
         if self._state is None:
             self.load()
-        
+
         now = datetime.now(timezone.utc).isoformat()
-        
+
         instance = self.find_instance(model, preset)
         if instance is None:
             instance = Instance(
                 instance_id=str(uuid.uuid4()),
                 model=model,
                 preset=preset,
-                managed_by_mcp=True,
+                managed_by_mcp=managed_by_mcp,
                 started_at=now,
-                port=None,
+                port=port,
             )
             self._state.instances.append(instance)
-        
+        elif instance.port is None and port is not None:
+            # Backfill ports on records created before ports were tracked.
+            instance.port = port
+
         lease = Lease(
             lease_id=str(uuid.uuid4()),
             instance_id=instance.instance_id,
@@ -174,6 +184,32 @@ class LeaseManager:
         
         return instance, lease
     
+    def remove_instance(self, instance_id: str) -> None:
+        """Drop an instance record and any leases attached to it. Used when
+        the server behind a record turns out to be gone (stale state)."""
+        if self._state is None:
+            self.load()
+        self._state.instances = [i for i in self._state.instances
+                                 if i.instance_id != instance_id]
+        self._state.leases = [l for l in self._state.leases
+                              if l.instance_id != instance_id]
+        self.save()
+
+    def remove_model_records(self, model: str) -> dict[str, int]:
+        """Drop every instance record and lease for a model (force stop)."""
+        if self._state is None:
+            self.load()
+        instance_ids = {i.instance_id for i in self._state.instances if i.model == model}
+        removed_leases = [l for l in self._state.leases if l.instance_id in instance_ids]
+        self._state.instances = [i for i in self._state.instances if i.model != model]
+        self._state.leases = [l for l in self._state.leases
+                              if l.instance_id not in instance_ids]
+        self.save()
+        return {
+            "removed_instances": len(instance_ids),
+            "removed_leases": len(removed_leases),
+        }
+
     def release_lease(self, lease_id: str) -> dict[str, Any]:
         """Release a lease by ID."""
         if self._state is None:
@@ -188,24 +224,26 @@ class LeaseManager:
         instance = next((i for i in self._state.instances 
                         if i.instance_id == lease.instance_id), None)
         
+        remaining = [l for l in self._state.leases
+                     if l.instance_id == lease.instance_id]
+
         should_stop = False
-        if instance and instance.managed_by_mcp:
-            remaining_leases = [l for l in self._state.leases 
-                              if l.instance_id == lease.instance_id]
-            if len(remaining_leases) == 0:
-                should_stop = True
-        
+        if instance and instance.managed_by_mcp and len(remaining) == 0:
+            should_stop = True
+
         if should_stop:
-            self._state.instances = [i for i in self._state.instances 
+            self._state.instances = [i for i in self._state.instances
                                    if i.instance_id != lease.instance_id]
-        
+
         self.save()
-        
+
         return {
             "success": True,
             "instance_stopped": should_stop,
             "instance_id": lease.instance_id,
             "model": instance.model if instance else None,
+            "remaining_leases": len(remaining),
+            "external": bool(instance) and not instance.managed_by_mcp,
         }
     
     def renew_lease(self, lease_id: str) -> bool:
