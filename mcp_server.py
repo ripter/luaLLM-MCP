@@ -19,6 +19,41 @@ client = LuaLLMClient()
 lease_manager = LeaseManager()
 
 
+def _error_detail(resp: dict) -> str:
+    """Best-available error text from a lua_client response.
+
+    luallm reports errors inconsistently (stderr, non-JSON stdout, or JSON
+    on stdout with a non-zero exit), so combine everything present instead
+    of returning an empty string.
+    """
+    data = resp.get("data")
+    if isinstance(data, dict) and data.get("message"):
+        # luallm --json failures are structured: {"error": code, "message": text}
+        code = data.get("error")
+        message = str(data["message"])
+        return f"{code}: {message}" if code and code != message else message
+    parts = []
+    error = resp.get("error")
+    if error:
+        parts.append(str(error))
+    stderr = (resp.get("stderr") or "").strip()
+    if stderr:
+        parts.append(f"stderr: {stderr[:500]}")
+    stdout = (resp.get("stdout") or "").strip()
+    if stdout:
+        parts.append(f"stdout: {stdout[:500]}")
+    if not parts and data:
+        parts.append(data if isinstance(data, str) else json.dumps(data))
+    if not parts:
+        returncode = resp.get("returncode")
+        parts.append(
+            f"luallm exited with code {returncode} and no output"
+            if returncode is not None
+            else "UNKNOWN_ERROR"
+        )
+    return " | ".join(parts)
+
+
 @mcp_server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
@@ -104,7 +139,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             result["data"] = resp.get("data", [])
         else:
             result["success"] = False
-            result["error"] = resp.get("stderr", "Unknown error")
+            result["error"] = _error_detail(resp)
     
     elif name == "get_model_info":
         model_name = arguments.get("model_name")
@@ -117,7 +152,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
                 result["data"] = resp.get("data", {})
             else:
                 result["success"] = False
-                result["error"] = resp.get("stderr", "Unknown error")
+                result["error"] = _error_detail(resp)
     
     elif name == "get_server_status":
         resp = client.get_server_status()
@@ -125,7 +160,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             result["data"] = resp.get("data", {})
         else:
             result["success"] = False
-            result["error"] = resp.get("stderr", "Unknown error")
+            result["error"] = _error_detail(resp)
     
     elif name == "get_capabilities":
         result["data"] = {
@@ -179,7 +214,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
                         }
                     else:
                         result["success"] = False
-                        result["error"] = start_resp.get("stderr", "START_FAILED")
+                        result["error"] = _error_detail(start_resp)
     
     elif name == "release_model":
         lease_id = arguments.get("lease_id")
@@ -218,7 +253,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
                     result["data"] = {"logs": logs}
                 else:
                     result["success"] = False
-                    result["error"] = resp.get("stderr", "LOGS_FAILED")
+                    result["error"] = _error_detail(resp)
             else:
                 result["success"] = False
                 result["error"] = "INSTANCE_NOT_FOUND"

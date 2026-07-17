@@ -5,10 +5,32 @@ import json
 from typing import Any
 
 
+def _extract_json(stdout: str) -> Any | None:
+    """Parse luallm --json output.
+
+    luallm prefixes its JSON with human-readable banner lines (e.g.
+    "Starting daemon: <model>" or "Port 8080 already in use — ..."), so a
+    plain json.loads of the whole stdout fails. Try the full text first,
+    then fall back to the first line that parses as JSON.
+    """
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        pass
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") or line.startswith("["):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 class LuaLLMClient:
     def __init__(self, luallm_path: str = "luallm"):
         self.luallm_path = luallm_path
-    
+
     def _run_command(self, args: list[str]) -> dict[str, Any]:
         """Run luallm command and return parsed JSON response."""
         result = subprocess.run(
@@ -19,11 +41,21 @@ class LuaLLMClient:
         )
         if result.returncode != 0 and not result.stdout:
             return {"success": False, "stderr": result.stderr, "returncode": result.returncode}
-        try:
-            data = json.loads(result.stdout) if result.stdout else {}
-            return {"success": result.returncode == 0, "data": data, "stderr": result.stderr}
-        except json.JSONDecodeError as e:
-            return {"success": False, "error": str(e), "stderr": result.stderr}
+        data = _extract_json(result.stdout) if result.stdout else {}
+        if data is None:
+            return {
+                "success": False,
+                "error": "luallm returned no JSON output",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+            }
+        return {
+            "success": result.returncode == 0,
+            "data": data,
+            "stderr": result.stderr,
+            "stdout": result.stdout,
+        }
     
     def list_models(self) -> dict[str, Any]:
         return self._run_command(["list", "--json"])

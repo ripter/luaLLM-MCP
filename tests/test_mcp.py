@@ -19,6 +19,68 @@ def test_lua_client_imports():
     assert client.luallm_path == "luallm"
 
 
+def test_run_command_parses_json_after_banner_lines(monkeypatch):
+    """luallm --json prefixes JSON with human-readable banner lines; the
+    client must still find the payload (observed with `luallm start`)."""
+    import subprocess
+    import lua_client
+
+    stdout = (
+        "Starting daemon: Maginum-24B\n"
+        '{"pid":81836,"model":"Maginum-24B","port":8080,"status":"started"}'
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    resp = lua_client.LuaLLMClient()._run_command(["start", "Maginum-24B", "--json"])
+
+    assert resp["success"] is True
+    assert resp["data"]["pid"] == 81836
+    assert resp["data"]["port"] == 8080
+
+
+def test_run_command_reports_non_json_error_output(monkeypatch):
+    """Pure human-readable error output must surface stdout, not an empty
+    error (observed when the model is already running outside MCP)."""
+    import subprocess
+    import lua_client
+
+    stdout = (
+        "Error: Maginum-24B is already running (PID 80181.0) on port 8080\n"
+        "Use 'luallm stop Maginum-24B' first."
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=1, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    resp = lua_client.LuaLLMClient()._run_command(["start", "Maginum-24B", "--json"])
+
+    assert resp["success"] is False
+    assert resp["stdout"] == stdout
+
+
+def test_error_detail_never_empty():
+    """The MCP envelope error must be non-empty for every failure shape."""
+    import mcp_server
+
+    assert mcp_server._error_detail({"stderr": "boom"}) == "stderr: boom"
+    assert "already running" in mcp_server._error_detail(
+        {"stdout": "Error: already running", "stderr": ""}
+    )
+    assert mcp_server._error_detail({"returncode": 7}) == "luallm exited with code 7 and no output"
+    assert mcp_server._error_detail({}) == "UNKNOWN_ERROR"
+    # Structured luallm --json error objects win over raw stream dumps
+    assert (
+        mcp_server._error_detail(
+            {"data": {"error": "start_failed", "message": "already running"}, "stdout": "raw"}
+        )
+        == "start_failed: already running"
+    )
+
+
 def test_lease_manager_imports():
     """Test that lease_manager module can be imported."""
     import lease_manager
