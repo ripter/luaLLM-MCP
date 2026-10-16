@@ -114,13 +114,20 @@ def _fake_client(models, running=None, start=None, stop_fails=False):
     return FakeClient()
 
 
-def _isolated(monkeypatch, tmp_path, client):
+def _isolated(monkeypatch, tmp_path, client, ready=True):
     import mcp_server
     import lease_manager
     monkeypatch.setattr(mcp_server, "lease_manager",
                         lease_manager.LeaseManager(state_dir=str(tmp_path)))
     monkeypatch.setattr(mcp_server, "client", client)
+    # Don't touch real ports in tests; readiness is simulated.
+    monkeypatch.setattr(mcp_server, "_probe_health", lambda port: ready)
     return mcp_server
+
+
+def _acquire(mcp_server, *args):
+    import asyncio
+    return asyncio.run(mcp_server._handle_acquire(*args))
 
 
 def test_acquire_adopts_external_instance(monkeypatch, tmp_path):
@@ -129,7 +136,7 @@ def test_acquire_adopts_external_instance(monkeypatch, tmp_path):
     mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
         ["ornith"], running=[{"model": "ornith", "state": "running", "port": 8080}]))
 
-    result = mcp_server._handle_acquire("ornith", None, "test", "adopt")
+    result = _acquire(mcp_server, "ornith", None, "test", "adopt")
     assert result["success"] is True
     assert result["data"]["external"] is True
     assert result["data"]["reused"] is True
@@ -143,7 +150,7 @@ def test_acquire_adopts_external_instance(monkeypatch, tmp_path):
 def test_acquire_external_with_preset_is_refused(monkeypatch, tmp_path):
     mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
         ["ornith"], running=[{"model": "ornith", "state": "running", "port": 8080}]))
-    result = mcp_server._handle_acquire("ornith", "throughput", "test", "t")
+    result = _acquire(mcp_server, "ornith", "throughput", "test", "t")
     assert result["success"] is False
     assert "MODEL_RUNNING_EXTERNALLY" in result["error"]
 
@@ -154,12 +161,12 @@ def test_acquire_reuse_reports_port(monkeypatch, tmp_path):
     mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
         ["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}}))
 
-    first = mcp_server._handle_acquire("tiny", None, "test", "t")
+    first = _acquire(mcp_server, "tiny", None, "test", "t")
     assert first["success"] is True
     assert first["data"]["reused"] is False
     assert first["data"]["port"] == 8081
 
-    second = mcp_server._handle_acquire("tiny", None, "test", "t")
+    second = _acquire(mcp_server, "tiny", None, "test", "t")
     assert second["data"]["reused"] is True
     assert second["data"]["external"] is False
     assert second["data"]["port"] == 8081
@@ -175,7 +182,7 @@ def test_acquire_drops_stale_instance_and_restarts(monkeypatch, tmp_path):
     stale_instance, stale_lease = mcp_server.lease_manager.acquire_lease(
         "skyfall", None, "old", "old", port=8082)
 
-    result = mcp_server._handle_acquire("skyfall", None, "test", "t")
+    result = _acquire(mcp_server, "skyfall", None, "test", "t")
     assert result["success"] is True
     assert result["data"]["reused"] is False
     assert result["data"]["port"] == 8083
@@ -190,7 +197,7 @@ def test_acquire_syncs_port_with_live_status(monkeypatch, tmp_path):
         ["tiny"], running=[{"model": "tiny", "state": "running", "port": 9091}]))
     mcp_server.lease_manager.acquire_lease("tiny", None, "old", "old", port=8080)
 
-    result = mcp_server._handle_acquire("tiny", None, "test", "t")
+    result = _acquire(mcp_server, "tiny", None, "test", "t")
     assert result["data"]["reused"] is True
     assert result["data"]["port"] == 9091
 
@@ -199,8 +206,8 @@ def test_release_stops_last_lease_and_reports_it(monkeypatch, tmp_path):
     client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
     mcp_server = _isolated(monkeypatch, tmp_path, client)
 
-    first = mcp_server._handle_acquire("tiny", None, "a", "t")
-    second = mcp_server._handle_acquire("tiny", None, "b", "t")
+    first = _acquire(mcp_server, "tiny", None, "a", "t")
+    second = _acquire(mcp_server, "tiny", None, "b", "t")
 
     rel1 = mcp_server._handle_release(second["data"]["lease_id"])
     assert rel1["success"] is True
@@ -216,7 +223,7 @@ def test_release_stops_last_lease_and_reports_it(monkeypatch, tmp_path):
 def test_release_surfaces_stop_failures(monkeypatch, tmp_path):
     mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
         ["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}}, stop_fails=True))
-    acq = mcp_server._handle_acquire("tiny", None, "a", "t")
+    acq = _acquire(mcp_server, "tiny", None, "a", "t")
     rel = mcp_server._handle_release(acq["data"]["lease_id"])
     assert rel["success"] is False
     assert "STOP_FAILED" in rel["error"]
@@ -226,7 +233,7 @@ def test_release_surfaces_stop_failures(monkeypatch, tmp_path):
 def test_release_never_stops_external_instances(monkeypatch, tmp_path):
     mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
         ["ornith"], running=[{"model": "ornith", "state": "running", "port": 8080}]))
-    acq = mcp_server._handle_acquire("ornith", None, "a", "t")
+    acq = _acquire(mcp_server, "ornith", None, "a", "t")
     assert acq["data"]["external"] is True
     rel = mcp_server._handle_release(acq["data"]["lease_id"])
     assert rel["success"] is True
@@ -238,8 +245,8 @@ def test_force_stop_purges_records_and_stops(monkeypatch, tmp_path):
     client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
     mcp_server = _isolated(monkeypatch, tmp_path, client)
     # Two leases, would normally block stopping.
-    mcp_server._handle_acquire("tiny", None, "a", "t")
-    mcp_server._handle_acquire("tiny", None, "b", "t")
+    _acquire(mcp_server, "tiny", None, "a", "t")
+    _acquire(mcp_server, "tiny", None, "b", "t")
 
     result = mcp_server._handle_force_stop("tiny")
     assert result["success"] is True
@@ -247,6 +254,46 @@ def test_force_stop_purges_records_and_stops(monkeypatch, tmp_path):
     assert result["data"]["removed_leases"] == 2
     assert client.stopped == ["tiny"]
     assert mcp_server.lease_manager.list_leases() == []
+
+
+def test_acquire_waits_until_the_model_is_ready():
+    """_wait_until_ready polls until the health probe goes green."""
+    import asyncio
+    import mcp_server
+
+    probes = iter([False, False, True])
+    original = mcp_server._probe_health
+    mcp_server._probe_health = lambda port: next(probes)
+    try:
+        ready, waited = asyncio.run(
+            mcp_server._wait_until_ready(8080, timeout_s=5, interval_s=0.01))
+    finally:
+        mcp_server._probe_health = original
+    assert ready is True
+    assert waited >= 0.02
+
+
+def test_acquire_fails_and_returns_lease_when_model_never_ready(monkeypatch, tmp_path):
+    """If loading exceeds the timeout: error out, take the lease back, but
+    keep the instance record — the model is still loading and a later
+    acquire should reuse it."""
+    monkeypatch.setenv("LUALLM_MCP_READY_TIMEOUT_SECONDS", "0")
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}}), ready=False)
+
+    result = _acquire(mcp_server, "tiny", None, "test", "t")
+    assert result["success"] is False
+    assert "MODEL_NOT_READY" in result["error"]
+    assert mcp_server.lease_manager.list_leases() == []
+    assert mcp_server.lease_manager.find_instance("tiny") is not None
+
+
+def test_acquire_reports_ready_wait_duration(monkeypatch, tmp_path):
+    mcp_server = _isolated(monkeypatch, tmp_path, _fake_client(
+        ["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}}))
+    result = _acquire(mcp_server, "tiny", None, "test", "t")
+    assert result["success"] is True
+    assert result["data"]["ready_after_s"] >= 0
 
 
 def test_acquire_backfills_port_from_status(monkeypatch, tmp_path):
@@ -258,7 +305,7 @@ def test_acquire_backfills_port_from_status(monkeypatch, tmp_path):
     mcp_server.lease_manager.acquire_lease("tiny", None, "old", "old")
     assert mcp_server.lease_manager.find_instance("tiny").port is None
 
-    result = mcp_server._handle_acquire("tiny", None, "test", "t")
+    result = _acquire(mcp_server, "tiny", None, "test", "t")
     assert result["data"]["reused"] is True
     assert result["data"]["port"] == 9090
 

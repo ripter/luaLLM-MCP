@@ -22,7 +22,8 @@ Runtime state is stored in OS-appropriate application data directories:
 Override with:
 ```bash
 export LUALLM_MCP_STATE_DIR=/custom/path
-export LUALLM_MCP_LEASE_TTL_SECONDS=7200  # 2 hours (default)
+export LUALLM_MCP_LEASE_TTL_SECONDS=7200      # 2 hours (default)
+export LUALLM_MCP_READY_TIMEOUT_SECONDS=600   # acquire waits this long for model load
 ```
 
 ## Usage

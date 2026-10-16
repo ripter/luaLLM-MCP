@@ -210,25 +210,29 @@ class LeaseManager:
             "removed_leases": len(removed_leases),
         }
 
-    def release_lease(self, lease_id: str) -> dict[str, Any]:
-        """Release a lease by ID."""
+    def release_lease(self, lease_id: str, keep_instance: bool = False) -> dict[str, Any]:
+        """Release a lease by ID.
+
+        keep_instance drops only the lease, never the instance record —
+        used when taking back a lease on a model that is still loading.
+        """
         if self._state is None:
             self.load()
-        
+
         lease = self.find_lease(lease_id)
         if lease is None:
             return {"success": False, "error": "LEASE_NOT_FOUND", "lease_id": lease_id}
-        
+
         self._state.leases = [l for l in self._state.leases if l.lease_id != lease_id]
-        
-        instance = next((i for i in self._state.instances 
+
+        instance = next((i for i in self._state.instances
                         if i.instance_id == lease.instance_id), None)
-        
+
         remaining = [l for l in self._state.leases
                      if l.instance_id == lease.instance_id]
 
         should_stop = False
-        if instance and instance.managed_by_mcp and len(remaining) == 0:
+        if instance and instance.managed_by_mcp and len(remaining) == 0 and not keep_instance:
             should_stop = True
 
         if should_stop:

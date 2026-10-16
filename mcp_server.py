@@ -3,6 +3,9 @@
 import asyncio
 import json
 import logging
+import os
+import urllib.error
+import urllib.request
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
@@ -54,6 +57,41 @@ def _error_detail(resp: dict) -> str:
     return " | ".join(parts)
 
 
+def _ready_timeout() -> float:
+    """How long acquire_model waits for the model to finish loading."""
+    return float(os.environ.get("LUALLM_MCP_READY_TIMEOUT_SECONDS", "600"))
+
+
+def _probe_health(port: int) -> bool:
+    """True once llama.cpp reports ready (200 on /health; 503 while loading)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+async def _wait_until_ready(port: int | None, timeout_s: float,
+                            interval_s: float = 1.0) -> tuple[bool, float]:
+    """Poll the model server until it is ready to serve requests.
+
+    A lease means "ready to use": llama.cpp accepts connections while the
+    model is still loading, so acquire must wait for /health to go green.
+    Returns (ready, seconds_waited). No port means nothing to probe.
+    """
+    if port is None:
+        return True, 0.0
+    loop = asyncio.get_event_loop()
+    started = loop.time()
+    deadline = started + timeout_s
+    while True:
+        if _probe_health(port):
+            return True, loop.time() - started
+        if loop.time() >= deadline:
+            return False, loop.time() - started
+        await asyncio.sleep(interval_s)
+
+
 def _find_running_server(model_name: str) -> dict | None:
     """Look up a running luallm server for the model, or None."""
     status_resp = client.get_server_status()
@@ -65,10 +103,11 @@ def _find_running_server(model_name: str) -> dict | None:
     return None
 
 
-def _handle_acquire(model_name: str | None, preset: str | None,
-                    client_id: str | None, purpose: str | None) -> dict:
+async def _handle_acquire(model_name: str | None, preset: str | None,
+                          client_id: str | None, purpose: str | None) -> dict:
     """acquire_model: reuse an MCP-managed instance, adopt an externally
-    started one (never stopped on release), or start the model."""
+    started one (never stopped on release), or start the model — then wait
+    until the model is actually ready to serve before returning the lease."""
     if not model_name:
         return {"success": False, "error": "MISSING_MODEL_NAME"}
 
@@ -78,38 +117,25 @@ def _handle_acquire(model_name: str | None, preset: str | None,
     if model_name not in [m.get("name") for m in models_resp.get("data", [])]:
         return {"success": False, "error": "MODEL_NOT_FOUND"}
 
-    def lease_data(instance, lease, reused: bool, pid=None) -> dict:
-        data = {
-            "instance_id": instance.instance_id,
-            "lease_id": lease.lease_id,
-            "model": model_name,
-            "preset": preset,
-            "port": instance.port,
-            "reused": reused,
-            "external": not instance.managed_by_mcp,
-        }
-        if pid is not None:
-            data["pid"] = pid
-        return data
-
     instance = lease_manager.find_instance(model_name, preset)
     running = _find_running_server(model_name)
+    lease = None
+    reused = True
+    pid = None
+
+    if instance and running is None:
+        # Stale record: the server behind it is gone (stopped or crashed
+        # outside MCP). Drop it and start fresh below.
+        logger.info(f"Dropping stale instance record for {model_name}")
+        lease_manager.remove_instance(instance.instance_id)
+        instance = None
 
     if instance:
-        if running is None:
-            # Stale record: the server behind it is gone (stopped or
-            # crashed outside MCP). Drop it and start fresh below.
-            logger.info(f"Dropping stale instance record for {model_name}")
-            lease_manager.remove_instance(instance.instance_id)
-            instance = None
-        else:
-            # Trust live status over the record (server may have moved ports).
-            port = running.get("port")
-            instance.port = int(port) if port is not None else instance.port
-            instance, lease = lease_manager.acquire_lease(model_name, preset, client_id, purpose)
-            return {"success": True, "data": lease_data(instance, lease, reused=True)}
-
-    if running:
+        # Trust live status over the record (server may have moved ports).
+        port = running.get("port")
+        instance.port = int(port) if port is not None else instance.port
+        instance, lease = lease_manager.acquire_lease(model_name, preset, client_id, purpose)
+    elif running:
         # Started outside the MCP (e.g. `luallm start` in a terminal).
         # Adopt it so workflows can use it; release will not stop it.
         if preset:
@@ -125,17 +151,46 @@ def _handle_acquire(model_name: str | None, preset: str | None,
             port=int(port) if port is not None else None,
             managed_by_mcp=False)
         logger.info(f"Adopted externally started instance of {model_name}")
-        return {"success": True, "data": lease_data(instance, lease, reused=True)}
+    else:
+        start_resp = client.start_model(model_name, preset)
+        if not start_resp["success"]:
+            return {"success": False, "error": _error_detail(start_resp)}
+        start_data = start_resp.get("data", {})
+        port = start_data.get("port")
+        pid = start_data.get("pid")
+        reused = False
+        instance, lease = lease_manager.acquire_lease(
+            model_name, preset, client_id, purpose,
+            port=int(port) if port is not None else None)
 
-    start_resp = client.start_model(model_name, preset)
-    if not start_resp["success"]:
-        return {"success": False, "error": _error_detail(start_resp)}
-    data = start_resp.get("data", {})
-    port = data.get("port")
-    instance, lease = lease_manager.acquire_lease(
-        model_name, preset, client_id, purpose,
-        port=int(port) if port is not None else None)
-    return {"success": True, "data": lease_data(instance, lease, reused=False, pid=data.get("pid"))}
+    # A lease means "ready to use": block until the server can actually
+    # serve (llama.cpp answers 503 on /health while loading weights).
+    timeout = _ready_timeout()
+    ready, waited = await _wait_until_ready(instance.port, timeout)
+    if not ready:
+        # Keep the instance record (the model keeps loading) but take the
+        # lease back so failed acquires don't accumulate refcounts.
+        lease_manager.release_lease(lease.lease_id, keep_instance=True)
+        return {
+            "success": False,
+            "error": (f"MODEL_NOT_READY: {model_name} did not become ready within "
+                      f"{int(timeout)}s (still loading). It continues loading in the "
+                      f"background — acquire again shortly, or force_stop_model to abort."),
+        }
+
+    data = {
+        "instance_id": instance.instance_id,
+        "lease_id": lease.lease_id,
+        "model": model_name,
+        "preset": preset,
+        "port": instance.port,
+        "reused": reused,
+        "external": not instance.managed_by_mcp,
+        "ready_after_s": round(waited, 1),
+    }
+    if pid is not None:
+        data["pid"] = pid
+    return {"success": True, "data": data}
 
 
 def _handle_release(lease_id: str | None) -> dict:
@@ -308,7 +363,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
         }
     
     elif name == "acquire_model":
-        result = _handle_acquire(
+        result = await _handle_acquire(
             arguments.get("model_name"),
             arguments.get("preset"),
             arguments.get("client_id"),
