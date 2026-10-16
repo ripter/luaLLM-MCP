@@ -14,6 +14,20 @@ class SchemaVersion:
     V1 = "1.0"
 
 
+def get_state_dir() -> str:
+    """Get OS-appropriate application data directory following luaLLM pattern."""
+    env_path = os.environ.get("LUALLM_MCP_STATE_DIR")
+    if env_path:
+        return env_path
+
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", os.environ.get("APPDATA", "~/.config"))
+        return str(Path(base).expanduser() / "luaLLM-MCP")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", "~/.config")
+        return str(Path(base).expanduser() / "luaLLM-MCP")
+
+
 @dataclass
 class Instance:
     instance_id: str
@@ -22,6 +36,10 @@ class Instance:
     managed_by_mcp: bool
     started_at: str
     port: int | None = None
+    # Profile name when the server was started through a curated profile
+    # (profiles.py). None means "no profile requested"; older state files
+    # that predate profiles load with the default and keep matching.
+    profile: str | None = None
     
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -74,22 +92,9 @@ class State:
 
 class LeaseManager:
     def __init__(self, state_dir: str | None = None):
-        self.state_dir = Path(state_dir or self._get_state_dir())
+        self.state_dir = Path(state_dir or get_state_dir())
         self.state_file = self.state_dir / "state.json"
         self._state: State | None = None
-    
-    def _get_state_dir(self) -> str:
-        """Get OS-appropriate application data directory following luaLLM pattern."""
-        env_path = os.environ.get("LUALLM_MCP_STATE_DIR")
-        if env_path:
-            return env_path
-        
-        if os.name == "nt":
-            base = os.environ.get("LOCALAPPDATA", os.environ.get("APPDATA", "~/.config"))
-            return str(Path(base).expanduser() / "luaLLM-MCP")
-        else:
-            base = os.environ.get("XDG_CONFIG_HOME", "~/.config")
-            return str(Path(base).expanduser() / "luaLLM-MCP")
     
     def _get_lease_ttl(self) -> int:
         """Get lease TTL in seconds from environment."""
@@ -122,12 +127,33 @@ class LeaseManager:
             self.load()
         self._atomic_save(self._state)
     
-    def find_instance(self, model: str, preset: str | None = None) -> Instance | None:
-        """Find running instance matching model and preset."""
+    def find_instance(self, model: str, preset: str | None = None,
+                      profile: str | None = None) -> Instance | None:
+        """Find running instance matching model, preset, and profile.
+
+        The (preset, profile) pair identifies the launch configuration:
+        same model under a different preset or profile is a different
+        instance and must not be reused.
+        """
         if self._state is None:
             self.load()
         for instance in self._state.instances:
-            if instance.model == model and instance.preset == preset:
+            if (instance.model == model and instance.preset == preset
+                    and instance.profile == profile):
+                return instance
+        return None
+
+    def find_instance_for_model(self, model: str) -> Instance | None:
+        """First instance record for a model under any configuration.
+
+        Used to detect that a running server belongs to this MCP (started
+        under some other preset/profile) so callers get told to stop it
+        instead of adopting it under the wrong configuration.
+        """
+        if self._state is None:
+            self.load()
+        for instance in self._state.instances:
+            if instance.model == model:
                 return instance
         return None
     
@@ -144,19 +170,22 @@ class LeaseManager:
                       client_id: str | None = None,
                       purpose: str | None = None,
                       port: int | None = None,
-                      managed_by_mcp: bool = True) -> tuple[Instance, Lease]:
+                      managed_by_mcp: bool = True,
+                      profile: str | None = None) -> tuple[Instance, Lease]:
         """Acquire a lease for a model instance.
 
         port/managed_by_mcp describe the instance when a new record is
         created: managed_by_mcp=False adopts an externally started server,
-        which release_lease will never stop.
+        which release_lease will never stop. profile records the curated
+        profile the server was started with and is part of the instance
+        identity alongside preset.
         """
         if self._state is None:
             self.load()
 
         now = datetime.now(timezone.utc).isoformat()
 
-        instance = self.find_instance(model, preset)
+        instance = self.find_instance(model, preset, profile)
         if instance is None:
             instance = Instance(
                 instance_id=str(uuid.uuid4()),
@@ -165,6 +194,7 @@ class LeaseManager:
                 managed_by_mcp=managed_by_mcp,
                 started_at=now,
                 port=port,
+                profile=profile,
             )
             self._state.instances.append(instance)
         elif instance.port is None and port is not None:

@@ -38,6 +38,65 @@ uv run python mcp_server.py
 
 The server uses stdio transport for MCP communication. It will print startup info and then wait for requests from an MCP client.
 
+## Profiles
+
+Profiles are operator-curated launch configurations: named bundles of extra
+llama.cpp flags (e.g. image projection, a larger context window, a generation
+cap). MCP clients can only apply a profile **by name** — they never supply
+raw flags — so everything that reaches llama-server is something you vetted
+in advance.
+
+Profiles live in `profiles.json` in the MCP state dir (same place as lease
+state, honors `LUALLM_MCP_STATE_DIR`):
+
+```json
+{
+  "profiles": {
+    "vision": {
+      "description": "Enable image projection for multimodal input",
+      "args": ["--mmproj", "~/dev/localGGUF/Qwen3.8-27B-mmproj-BF16.gguf"]
+    },
+    "big-context": {
+      "description": "32k context window on top of the throughput preset",
+      "preset": "throughput",
+      "args": ["-c", "32768"]
+    },
+    "short-gen": {
+      "description": "Cap generation at 512 tokens",
+      "args": "-n 512"
+    }
+  }
+}
+```
+
+- `args` is a list of flag strings (or one string, split like a shell line).
+- `preset` (optional) is a raw luallm preset (`throughput`, `cold-start`) the
+  profile starts from; profile args are appended last and win flag conflicts.
+- `description` is optional and shown by `list_profiles`.
+
+The file hot-reloads on every `list_profiles` / `acquire_model` call, so
+editing it does not require restarting the server. Broken entries are
+reported back via the tools instead of silently ignored; `--preset` and
+`--json` inside `args` are rejected (both are already managed by the server).
+
+The MCP tool surface:
+
+- `list_profiles` — enumerate available profiles (name, description, flags)
+- `acquire_model` — gains a `profile` argument; on start it applies the
+  profile's preset and flags and records the profile in the instance state,
+  on reuse it will only attach to an instance started with the same profile
+
+Rules that follow from luallm running at most one server per model:
+
+- Switching configuration requires a stop: acquiring a preset/profile that
+  differs from the running instance fails with `MODEL_RUNNING_DIFFERENT_CONFIG`.
+  Release its leases (stops the model) or `force_stop_model`, then acquire.
+- A profile/preset cannot be applied to a server started outside the MCP;
+  that fails with `MODEL_RUNNING_EXTERNALLY` (same as preset today).
+
+The plain `preset` argument still works for raw luallm presets, but a caller
+must give at most one of `preset` / `profile` at a time.
+
 ## Manual Testing
 
 Test that the server initializes correctly:
@@ -65,16 +124,18 @@ asyncio.run(test())
 
 Expected output:
 ```
-Found 9 tools:
+Found 11 tools:
   - list_models
   - get_model_info
   - get_server_status
   - get_capabilities
   - acquire_model
   - release_model
+  - force_stop_model
   - get_model_logs
   - health_check
   - list_leases
+  - list_profiles
 ```
 
 ## MCP Tools

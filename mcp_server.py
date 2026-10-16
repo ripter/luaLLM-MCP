@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import urllib.error
 import urllib.request
 from mcp.server import Server
@@ -13,6 +14,7 @@ from mcp.types import Tool, TextContent, ServerCapabilities, ToolsCapability
 
 from lua_client import LuaLLMClient
 from lease_manager import LeaseManager
+from profiles import ProfileRegistry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("luaLLM-MCP")
@@ -20,6 +22,7 @@ logger = logging.getLogger("luaLLM-MCP")
 mcp_server = Server("luaLLM")
 client = LuaLLMClient()
 lease_manager = LeaseManager()
+profile_registry = ProfileRegistry()
 
 
 def _error_detail(resp: dict) -> str:
@@ -62,33 +65,79 @@ def _ready_timeout() -> float:
     return float(os.environ.get("LUALLM_MCP_READY_TIMEOUT_SECONDS", "600"))
 
 
-def _probe_health(port: int) -> bool:
-    """True once llama.cpp reports ready (200 on /health; 503 while loading)."""
+def _process_alive(pid: int | None) -> bool:
+    """True if a process with this pid is running (best-effort, no pid = yes)."""
+    if pid is None:
+        return True
+    try:
+        result = subprocess.run(["ps", "-p", str(pid)],
+                                capture_output=True, text=True,
+                                check=False)
+        return result.returncode == 0
+    except (OSError, ValueError):
+        return True
+
+
+def _probe_health(port: int) -> int:
+    """Health state of the model server on port: 2 ready, 1 loading, 0 refused.
+
+    llama.cpp answers 200 on /health once loaded and 503 while loading
+    (urllib surfaces that as HTTPError — still proof the server is up).
+    A refusal means the port is closed: normal for the first moment after
+    launch, fatal once the server has ever accepted a connection, and
+    inconclusive otherwise (pid-liveness resolves it via _wait_until_ready).
+    """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
-            return resp.status == 200
+            return 2 if resp.status == 200 else 1
+    except urllib.error.HTTPError:
+        return 1
     except (urllib.error.URLError, OSError, TimeoutError):
-        return False
+        return 0
 
 
 async def _wait_until_ready(port: int | None, timeout_s: float,
-                            interval_s: float = 1.0) -> tuple[bool, float]:
+                            interval_s: float = 1.0,
+                            pid: int | None = None) -> tuple[str, float]:
     """Poll the model server until it is ready to serve requests.
 
     A lease means "ready to use": llama.cpp accepts connections while the
     model is still loading, so acquire must wait for /health to go green.
-    Returns (ready, seconds_waited). No port means nothing to probe.
+    Returns ("ready" | "timeout" | "crashed", seconds waited).
+
+    "crashed" fires when the server is provably gone: a port that had
+    accepted connections starts refusing them, or a known-daemon pid
+    disappears while the port keeps refusing. Either means the process
+    died during load and will never become ready — most often a broken
+    model file or an invalid flag from a profile; waiting out the full
+    timeout would just stall the caller. "timeout" keeps the instance
+    record because a slow load is still in progress; "crashed" callers
+    must drop it. No port means nothing to probe.
     """
     if port is None:
-        return True, 0.0
+        return "ready", 0.0
     loop = asyncio.get_event_loop()
     started = loop.time()
     deadline = started + timeout_s
+    ever_accepted = False
     while True:
-        if _probe_health(port):
-            return True, loop.time() - started
+        state = _probe_health(port)
+        if state == 2:
+            return "ready", loop.time() - started
+        if state == 1:
+            ever_accepted = True
+        else:
+            if ever_accepted:
+                logger.error(f"Model server on port {port} stopped accepting "
+                             f"connections — the process died during startup.")
+                return "crashed", loop.time() - started
+            if pid is not None and not _process_alive(pid):
+                logger.error(f"Model server process {pid} is gone while port "
+                             f"{port} refuses connections — died before the "
+                             f"listener opened.")
+                return "crashed", loop.time() - started
         if loop.time() >= deadline:
-            return False, loop.time() - started
+            return "timeout", loop.time() - started
         await asyncio.sleep(interval_s)
 
 
@@ -104,10 +153,39 @@ def _find_running_server(model_name: str) -> dict | None:
 
 
 async def _handle_acquire(model_name: str | None, preset: str | None,
-                          client_id: str | None, purpose: str | None) -> dict:
+                          client_id: str | None, purpose: str | None,
+                          profile_name: str | None = None) -> dict:
     """acquire_model: reuse an MCP-managed instance, adopt an externally
     started one (never stopped on release), or start the model — then wait
-    until the model is actually ready to serve before returning the lease."""
+    until the model is actually ready to serve before returning the lease.
+
+    A profile (profiles.json) bundles curated extra flag arguments; clients
+    can only select them by name, and a profile may itself reference a
+    luallm preset. preset and profile are exclusive on the tool contract.
+    """
+    profile = None
+    if profile_name:
+        if preset:
+            return {
+                "success": False,
+                "error": ("PRESET_AND_PROFILE_EXCLUSIVE: give preset or profile, "
+                          "not both — a profile already specifies its own luallm "
+                          "preset via profiles.json."),
+            }
+        profile = profile_registry.get(profile_name)
+        if profile is None:
+            profiles, errors = profile_registry.load()
+            msg = (f"PROFILE_NOT_FOUND: '{profile_name}' is not a defined "
+                   f"profile (from {profile_registry.path}).")
+            if errors:
+                msg += " Profiles file problems: " + "; ".join(errors)
+            elif profiles:
+                msg += " Available profiles: " + ", ".join(p.name for p in profiles)
+            else:
+                msg += " No profiles are defined yet — create them in " \
+                       f"{profile_registry.path} (see README)."
+            return {"success": False, "error": msg}
+
     if not model_name:
         return {"success": False, "error": "MISSING_MODEL_NAME"}
 
@@ -117,7 +195,11 @@ async def _handle_acquire(model_name: str | None, preset: str | None,
     if model_name not in [m.get("name") for m in models_resp.get("data", [])]:
         return {"success": False, "error": "MODEL_NOT_FOUND"}
 
-    instance = lease_manager.find_instance(model_name, preset)
+    # The luallm preset actually applied: the caller's, or the one the
+    # profile bundles with its extra flags.
+    effective_preset = profile.preset if profile else preset
+
+    instance = lease_manager.find_instance(model_name, effective_preset, profile_name)
     running = _find_running_server(model_name)
     lease = None
     reused = True
@@ -134,25 +216,44 @@ async def _handle_acquire(model_name: str | None, preset: str | None,
         # Trust live status over the record (server may have moved ports).
         port = running.get("port")
         instance.port = int(port) if port is not None else instance.port
-        instance, lease = lease_manager.acquire_lease(model_name, preset, client_id, purpose)
+        instance, lease = lease_manager.acquire_lease(
+            model_name, effective_preset, client_id, purpose, profile=profile_name)
     elif running:
-        # Started outside the MCP (e.g. `luallm start` in a terminal).
-        # Adopt it so workflows can use it; release will not stop it.
-        if preset:
+        other = lease_manager.find_instance_for_model(model_name)
+        if other:
+            # One server per model (luallm refuses a second start), so this
+            # server belongs to the other record's configuration. Adopting it
+            # under the requested config would claim flags it doesn't carry.
+            cfg = (f"profile '{other.profile}'" if other.profile
+                   else f"preset '{other.preset}'" if other.preset
+                   else "the default configuration")
             return {
                 "success": False,
-                "error": (f"MODEL_RUNNING_EXTERNALLY: {model_name} is already running outside "
-                          f"MCP management, so the '{preset}' preset cannot be applied. "
-                          f"Acquire without a preset to use it, or stop it first."),
+                "error": (f"MODEL_RUNNING_DIFFERENT_CONFIG: {model_name} is already "
+                          f"running with {cfg}; luallm cannot start a second server "
+                          f"for the same model. Release its leases or force_stop_model, "
+                          f"then acquire again with the requested configuration."),
+            }
+        # Started outside the MCP (e.g. `luallm start` in a terminal).
+        # Adopt it so workflows can use it; release will not stop it.
+        if preset or profile:
+            wanted = f"profile '{profile_name}'" if profile else f"preset '{preset}'"
+            return {
+                "success": False,
+                "error": (f"MODEL_RUNNING_EXTERNALLY: {model_name} is already running "
+                          f"outside MCP management, so {wanted} cannot be applied. "
+                          f"Acquire without a preset/profile to use it, or stop it first."),
             }
         port = running.get("port")
         instance, lease = lease_manager.acquire_lease(
-            model_name, preset, client_id, purpose,
+            model_name, effective_preset, client_id, purpose,
             port=int(port) if port is not None else None,
             managed_by_mcp=False)
         logger.info(f"Adopted externally started instance of {model_name}")
     else:
-        start_resp = client.start_model(model_name, preset)
+        start_resp = client.start_model(
+            model_name, effective_preset,
+            extra_args=list(profile.args) if profile else None)
         if not start_resp["success"]:
             return {"success": False, "error": _error_detail(start_resp)}
         start_data = start_resp.get("data", {})
@@ -160,17 +261,28 @@ async def _handle_acquire(model_name: str | None, preset: str | None,
         pid = start_data.get("pid")
         reused = False
         instance, lease = lease_manager.acquire_lease(
-            model_name, preset, client_id, purpose,
-            port=int(port) if port is not None else None)
+            model_name, effective_preset, client_id, purpose,
+            port=int(port) if port is not None else None, profile=profile_name)
 
     # A lease means "ready to use": block until the server can actually
     # serve (llama.cpp answers 503 on /health while loading weights).
     timeout = _ready_timeout()
-    ready, waited = await _wait_until_ready(instance.port, timeout)
-    if not ready:
-        # Keep the instance record (the model keeps loading) but take the
-        # lease back so failed acquires don't accumulate refcounts.
-        lease_manager.release_lease(lease.lease_id, keep_instance=True)
+    ready_state, waited = await _wait_until_ready(instance.port, timeout, pid=pid)
+    if ready_state != "ready":
+        # Take the lease back so failed acquires don't accumulate
+        # refcounts. A slow load keeps the instance record (the model is
+        # still loading); a crashed server's record is garbage and goes.
+        lease_manager.release_lease(
+            lease.lease_id, keep_instance=(ready_state == "timeout"))
+    if ready_state == "crashed":
+        return {
+            "success": False,
+            "error": (f"SERVER_EXITED: {model_name} died during startup (port "
+                      f"{instance.port} stopped accepting connections). Check "
+                      f"`luallm logs {model_name}` for the actual error — a bad "
+                      f"model file or an invalid profile flag are common causes."),
+        }
+    if ready_state == "timeout":
         return {
             "success": False,
             "error": (f"MODEL_NOT_READY: {model_name} did not become ready within "
@@ -182,12 +294,15 @@ async def _handle_acquire(model_name: str | None, preset: str | None,
         "instance_id": instance.instance_id,
         "lease_id": lease.lease_id,
         "model": model_name,
-        "preset": preset,
+        "preset": effective_preset,
         "port": instance.port,
         "reused": reused,
         "external": not instance.managed_by_mcp,
         "ready_after_s": round(waited, 1),
     }
+    if profile is not None:
+        data["profile"] = profile.name
+        data["args"] = profile.args
     if pid is not None:
         data["pid"] = pid
     return {"success": True, "data": data}
@@ -236,6 +351,17 @@ def _handle_force_stop(model_name: str | None) -> dict:
     return {"success": True, "data": {"model": model_name, "stopped": True, **removed}}
 
 
+def _handle_list_profiles() -> dict:
+    """list_profiles: discover curated launch profiles and the file to
+    edit to define more. Subprocess-free, so it doubles as a config
+    sanity check."""
+    profiles, errors = profile_registry.load()
+    data: dict = {"profiles": [p.to_dict() for p in profiles], "file": str(profile_registry.path)}
+    if errors:
+        data["warnings"] = errors
+    return {"success": True, "data": data}
+
+
 @mcp_server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
@@ -265,12 +391,20 @@ async def handle_list_tools() -> list[Tool]:
         ),
         Tool(
             name="acquire_model",
-            description="Acquire a lease on a model instance. Starts the model if not running.",
+            description=(
+                "Acquire a lease on a model instance. Starts the model if not running. "
+                "Optional 'profile' selects an operator-curated launch configuration "
+                "(see list_profiles); optional 'preset' is a raw luallm preset. "
+                "Give at most one of the two."),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "model_name": {"type": "string", "description": "Model name"},
-                    "preset": {"type": "string", "description": "Optional preset (throughput, cold-start)"},
+                    "preset": {"type": "string", "description": "Raw luallm preset (throughput, cold-start)"},
+                    "profile": {
+                        "type": "string",
+                        "description": "Named curated profile with preconfigured flags (use list_profiles)",
+                    },
                     "client_id": {"type": "string", "description": "Client identifier for lease ownership"},
                     "purpose": {"type": "string", "description": "Purpose of the lease"},
                 },
@@ -317,6 +451,14 @@ async def handle_list_tools() -> list[Tool]:
             description="List all current leases (read-only diagnostic)",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        Tool(
+            name="list_profiles",
+            description=(
+                "List curated model launch profiles. Pass one by name as the "
+                "'profile' argument of acquire_model to start a model with its "
+                "preconfigured settings (e.g. image projection, context size)."),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
     ]
 
 
@@ -358,7 +500,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             "tools": ["list_models", "get_model_info", "get_server_status",
                      "get_capabilities", "acquire_model", "release_model",
                      "force_stop_model", "get_model_logs", "health_check",
-                     "list_leases"],
+                     "list_leases", "list_profiles"],
             "version": "1.0",
         }
     
@@ -368,6 +510,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             arguments.get("preset"),
             arguments.get("client_id"),
             arguments.get("purpose"),
+            profile_name=arguments.get("profile"),
         )
     
     elif name == "release_model":
@@ -407,7 +550,10 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
     
     elif name == "list_leases":
         result["data"] = lease_manager.list_leases()
-    
+
+    elif name == "list_profiles":
+        result = _handle_list_profiles()
+
     else:
         result["success"] = False
         result["error"] = f"UNKNOWN_TOOL: {name}"
