@@ -83,6 +83,34 @@ def test_error_detail_never_empty():
     )
 
 
+def test_server_ships_usage_instructions():
+    """Handshake instructions are the only docs a connected LLM is
+    guaranteed to see; they must carry the contract, not tool plumbing."""
+    import mcp_server
+
+    instructions = mcp_server.mcp_server.instructions
+    assert instructions
+    for fragment in (
+        "acquire_model", "release_model", "lease_id", "instance_id",
+        "127.0.0.1:{port}", "MODEL_RUNNING_DIFFERENT_CONFIG",
+        "MODEL_NOT_READY", "SERVER_EXITED", "MODEL_RUNNING_EXTERNALLY",
+    ):
+        assert fragment in instructions, f"missing: {fragment}"
+
+
+def test_get_capabilities_echoes_usage_guide():
+    """In-band fallback for clients that don't surface server instructions:
+    get_capabilities must return the same usage guide."""
+    import asyncio
+
+    import mcp_server
+
+    result, = [json.loads(c.text) for c in asyncio.run(
+        mcp_server.handle_call_tool("get_capabilities", {}))]
+    assert result["success"] is True
+    assert result["data"]["usage"] == mcp_server.SERVER_INSTRUCTIONS
+
+
 def _fake_client(models, running=None, start=None, stop_fails=False):
     servers = list(running or [])
 
@@ -92,6 +120,10 @@ def _fake_client(models, running=None, start=None, stop_fails=False):
             self.started = []
 
         def list_models(self):
+            # models: list of names, or {name: luallm size string}
+            if isinstance(models, dict):
+                return {"success": True,
+                        "data": [{"name": m, "size": sz} for m, sz in models.items()]}
             return {"success": True, "data": [{"name": m} for m in models]}
 
         def get_server_status(self):
@@ -120,8 +152,14 @@ def _fake_client(models, running=None, start=None, stop_fails=False):
     return FakeClient()
 
 
-def _isolated(monkeypatch, tmp_path, client, ready=2):
+def _isolated(monkeypatch, tmp_path, client, ready=2, grace="0", budget_gb="1000"):
+    """grace defaults to 0 (stop on last release) so lifecycle tests stay
+    deterministic; idle-grace tests opt in. The memory budget is pinned so
+    results don't depend on the test machine's RAM."""
     import mcp_server
+    monkeypatch.setenv("LUALLM_MCP_IDLE_GRACE_SECONDS", grace)
+    monkeypatch.setenv("LUALLM_MCP_MEMORY_BUDGET_GB", budget_gb)
+    monkeypatch.delenv("LUALLM_MCP_MEMORY_OVERHEAD", raising=False)
     import lease_manager
     import profiles
     monkeypatch.setattr(mcp_server, "lease_manager",
@@ -585,10 +623,11 @@ def test_lease_manager_state_dir():
     assert "luaLLM-MCP" in state_dir
 
 
-def test_lease_manager_acquire_release():
-    """Test lease acquire and release cycle."""
+def test_lease_manager_acquire_release(monkeypatch):
+    """Test lease acquire and release cycle (grace 0: stop immediately)."""
     import tempfile
     import lease_manager
+    monkeypatch.setenv("LUALLM_MCP_IDLE_GRACE_SECONDS", "0")
     
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = lease_manager.LeaseManager(state_dir=tmpdir)
@@ -763,3 +802,197 @@ def test_profile_registry_hot_reloads(tmp_path):
     assert registry.get("vision") is None
     _write_profiles(tmp_path, {"vision": {"args": ["--mmproj", "/m.gguf"]}})
     assert registry.get("vision") is not None
+
+
+# --- idle grace period and memory-pressure eviction -------------------------
+
+def _age_idle(mcp_server, model, seconds):
+    """Backdate a model's idle_since so the grace period looks elapsed."""
+    from datetime import datetime, timedelta, timezone
+    inst = mcp_server.lease_manager.find_instance_for_model(model)
+    inst.idle_since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    mcp_server.lease_manager.save()
+
+
+def test_default_idle_grace_is_five_minutes(monkeypatch, tmp_path):
+    import lease_manager
+    monkeypatch.delenv("LUALLM_MCP_IDLE_GRACE_SECONDS", raising=False)
+    assert lease_manager.LeaseManager(state_dir=str(tmp_path)).idle_grace_seconds() == 300
+
+
+def test_release_then_reacquire_reuses_warm_model(monkeypatch, tmp_path):
+    """The point of the grace period: release → re-acquire must not stop and
+    cold-start the same model."""
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300")
+
+    first = _acquire(mcp_server, "tiny", None, "a", "t")
+    rel = mcp_server._handle_release(first["data"]["lease_id"])
+    assert rel["success"] is True
+    assert rel["data"]["stopped"] is False
+    assert rel["data"]["idle"] is True
+    assert rel["data"]["idle_grace_s"] == 300
+    assert client.stopped == []
+
+    second = _acquire(mcp_server, "tiny", None, "a", "t")
+    assert second["success"] is True
+    assert second["data"]["reused"] is True
+    assert second["data"]["instance_id"] == first["data"]["instance_id"]
+    assert len(client.started) == 1
+    assert mcp_server.lease_manager.find_instance_for_model("tiny").idle_since is None
+
+
+def test_reaper_waits_out_the_grace_period_then_stops(monkeypatch, tmp_path):
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300")
+    acq = _acquire(mcp_server, "tiny", None, "a", "t")
+    mcp_server._handle_release(acq["data"]["lease_id"])
+
+    assert mcp_server._reap_idle() == []
+    _age_idle(mcp_server, "tiny", 299)
+    assert mcp_server._reap_idle() == []
+    _age_idle(mcp_server, "tiny", 301)
+    assert mcp_server._reap_idle() == ["tiny"]
+    assert client.stopped == ["tiny"]
+    assert mcp_server.lease_manager.find_instance_for_model("tiny") is None
+
+
+def test_reaper_never_stops_leased_or_external_models(monkeypatch, tmp_path):
+    client = _fake_client(
+        ["tiny", "ornith"], start={"success": True, "data": {"pid": 1, "port": 8081}},
+        running=[{"model": "ornith", "state": "running", "port": 8080}])
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="1")
+    _acquire(mcp_server, "tiny", None, "a", "t")
+    ext = _acquire(mcp_server, "ornith", None, "a", "t")
+    mcp_server._handle_release(ext["data"]["lease_id"])
+    _age_idle(mcp_server, "tiny", 3600)
+    _age_idle(mcp_server, "ornith", 3600)
+
+    assert mcp_server._reap_idle() == []
+    assert client.stopped == []
+
+
+def test_reaper_keeps_record_when_stop_fails(monkeypatch, tmp_path):
+    """A failed stop on a still-running server is retried next sweep."""
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}},
+                          stop_fails=True)
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300")
+    acq = _acquire(mcp_server, "tiny", None, "a", "t")
+    mcp_server._handle_release(acq["data"]["lease_id"])
+    _age_idle(mcp_server, "tiny", 600)
+
+    assert mcp_server._reap_idle() == []
+    assert mcp_server.lease_manager.find_instance_for_model("tiny") is not None
+
+
+def test_expired_leases_leave_instance_idle_for_reaping(monkeypatch, tmp_path):
+    """Leases dropped by TTL never went through release; the instance must
+    still be treated as idle (stamped on first notice), not leak forever."""
+    import lease_manager
+    monkeypatch.setenv("LUALLM_MCP_IDLE_GRACE_SECONDS", "300")
+    manager = lease_manager.LeaseManager(state_dir=str(tmp_path))
+    instance, lease = manager.acquire_lease("tiny", None)
+    manager._state.leases = []  # as if expire_stale_leases dropped it
+    assert instance.idle_since is None
+
+    idle = manager.idle_instances()
+    assert [i.instance_id for i in idle] == [instance.instance_id]
+    assert instance.idle_since is not None
+    assert manager.expired_idle_instances() == []
+
+
+def test_crashed_start_is_not_kept_idle(monkeypatch, tmp_path):
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300")
+    states = iter([1, 0])
+    monkeypatch.setattr(mcp_server, "_probe_health", lambda port: next(states, 0))
+    result = _acquire(mcp_server, "tiny", None, "a", "t")
+    assert "SERVER_EXITED" in result["error"]
+    assert mcp_server.lease_manager.find_instance_for_model("tiny") is None
+
+
+def test_idle_model_under_other_config_is_swapped(monkeypatch, tmp_path):
+    """With the grace period an idle model would otherwise block a new
+    configuration with MODEL_RUNNING_DIFFERENT_CONFIG; nobody holds it, so
+    it is stopped and restarted under the requested config."""
+    _write_profiles(tmp_path, {"short-gen": {"args": ["-n", "512"]}})
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300")
+    first = _acquire(mcp_server, "tiny", None, "a", "t")
+    mcp_server._handle_release(first["data"]["lease_id"])
+
+    second = _acquire(mcp_server, "tiny", None, "a", "t", profile_name="short-gen")
+    assert second["success"] is True
+    assert second["data"]["reused"] is False
+    assert second["data"]["profile"] == "short-gen"
+    assert second["data"]["evicted_idle"] == ["tiny"]
+    assert client.stopped == ["tiny"]
+
+
+def test_leased_model_under_other_config_still_refused(monkeypatch, tmp_path):
+    _write_profiles(tmp_path, {"short-gen": {"args": ["-n", "512"]}})
+    client = _fake_client(["tiny"], start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300")
+    _acquire(mcp_server, "tiny", None, "a", "t")
+    result = _acquire(mcp_server, "tiny", None, "a", "t", profile_name="short-gen")
+    assert "MODEL_RUNNING_DIFFERENT_CONFIG" in result["error"]
+    assert client.stopped == []
+
+
+def _idle_pair(monkeypatch, tmp_path, budget_gb):
+    """old (idle longest) and new (idle more recently), 20 GB each → 24 GB
+    footprint with the default 1.2 overhead."""
+    sizes = {"old": "20GB", "new": "20GB", "big": "20GB", "huge": "60GB"}
+    client = _fake_client(sizes, start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300", budget_gb=budget_gb)
+    a = _acquire(mcp_server, "old", None, "a", "t")
+    b = _acquire(mcp_server, "new", None, "a", "t")
+    mcp_server._handle_release(a["data"]["lease_id"])
+    mcp_server._handle_release(b["data"]["lease_id"])
+    return mcp_server, client
+
+
+def test_memory_pressure_evicts_longest_idle_first(monkeypatch, tmp_path):
+    # 48 GB used + 24 GB needed > 50 GB; evicting "old" alone is enough.
+    mcp_server, client = _idle_pair(monkeypatch, tmp_path, budget_gb="50")
+    result = _acquire(mcp_server, "big", None, "a", "t")
+    assert result["success"] is True
+    assert result["data"]["evicted_idle"] == ["old"]
+    assert client.stopped == ["old"]
+    assert mcp_server.lease_manager.find_instance_for_model("new") is not None
+
+
+def test_memory_pressure_evicts_until_it_fits(monkeypatch, tmp_path):
+    # huge needs 72 GB of an 80 GB budget: both idle models must go.
+    mcp_server, client = _idle_pair(monkeypatch, tmp_path, budget_gb="80")
+    result = _acquire(mcp_server, "huge", None, "a", "t")
+    assert result["data"]["evicted_idle"] == ["old", "new"]
+
+
+def test_no_eviction_when_memory_fits(monkeypatch, tmp_path):
+    mcp_server, client = _idle_pair(monkeypatch, tmp_path, budget_gb="100")
+    result = _acquire(mcp_server, "big", None, "a", "t")
+    assert "evicted_idle" not in result["data"]
+    assert client.stopped == []
+
+
+def test_memory_pressure_never_evicts_leased_models(monkeypatch, tmp_path):
+    """Only idle models are freed; a start that still won't fit proceeds
+    (the estimate is a heuristic, not an admission limit)."""
+    sizes = {"held": "20GB", "big": "20GB"}
+    client = _fake_client(sizes, start={"success": True, "data": {"pid": 1, "port": 8081}})
+    mcp_server = _isolated(monkeypatch, tmp_path, client, grace="300", budget_gb="30")
+    _acquire(mcp_server, "held", None, "a", "t")
+    result = _acquire(mcp_server, "big", None, "a", "t")
+    assert result["success"] is True
+    assert client.stopped == []
+
+
+def test_parse_size():
+    import mcp_server
+    assert mcp_server._parse_size("26.6GB") == int(26.6 * 1024**3)
+    assert mcp_server._parse_size("512MB") == 512 * 1024**2
+    assert mcp_server._parse_size("1.5 TiB") == int(1.5 * 1024**4)
+    assert mcp_server._parse_size(1234) == 1234
+    assert mcp_server._parse_size("unknown") is None
+    assert mcp_server._parse_size(None) is None

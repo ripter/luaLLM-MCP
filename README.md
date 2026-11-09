@@ -24,7 +24,28 @@ Override with:
 export LUALLM_MCP_STATE_DIR=/custom/path
 export LUALLM_MCP_LEASE_TTL_SECONDS=7200      # 2 hours (default)
 export LUALLM_MCP_READY_TIMEOUT_SECONDS=600   # acquire waits this long for model load
+export LUALLM_MCP_IDLE_GRACE_SECONDS=300      # keep a released model warm this long (0 = stop at once)
+export LUALLM_MCP_MEMORY_BUDGET_GB=96         # memory models may use (default: 75% of RAM)
+export LUALLM_MCP_MEMORY_OVERHEAD=1.2         # loaded footprint ≈ GGUF size × this
 ```
+
+### Idle grace period and memory pressure
+
+Releasing a model's last lease does not stop it right away. It stays
+running, idle, for `LUALLM_MCP_IDLE_GRACE_SECONDS` (5 minutes by default),
+so a workflow that releases and re-acquires the same model gets the warm
+server back instead of a stop plus a cold load. A background sweep stops
+models whose grace period has lapsed; leases dropped by the TTL are treated
+the same way. Idle models are also stopped when the MCP server shuts down.
+
+Before starting a model, the MCP estimates whether it fits:
+GGUF size × `LUALLM_MCP_MEMORY_OVERHEAD`, against the memory budget minus
+every running server (leased, idle, or external). If it doesn't fit, idle
+models are stopped longest-idle first until it does; the stopped models are
+listed in the acquire response as `evicted_idle`. Leased and externally
+started servers are never evicted. If the model still won't fit after every
+idle model is gone, the start goes ahead anyway with a warning in the log,
+because the estimate is a heuristic.
 
 ## Usage
 
@@ -127,8 +148,10 @@ luallm runs at most one server per model, so:
 
 - **Switching configuration requires a stop.** Acquiring a preset/profile
   that differs from the running instance fails with
-  `MODEL_RUNNING_DIFFERENT_CONFIG`. Release its leases (which stops the
-  model when the last lease goes) or `force_stop_model`, then acquire again.
+  `MODEL_RUNNING_DIFFERENT_CONFIG` while the instance holds leases. Release
+  them or `force_stop_model`, then acquire again. If the instance is only
+  idle (no leases, inside its grace period), it is stopped and restarted
+  under the requested configuration automatically.
 - **Profile/preset cannot be applied to a server started outside the MCP**
   (e.g. from a terminal) — that fails with `MODEL_RUNNING_EXTERNALLY`.
 - If the model **crashes during startup** (bad model file, invalid flag —
@@ -193,7 +216,7 @@ Found 11 tools:
 | `list_models()` | List all available models |
 | `get_model_info(model_name)` | Get model metadata |
 | `get_server_status()` | Get running servers |
-| `get_capabilities()` | List MCP capabilities |
+| `get_capabilities()` | Server capabilities plus the full LLM usage guide |
 | `acquire_model(model_name, preset?, profile?, client_id?, purpose?)` | Acquire lease on model; optional curated profile or raw luallm preset |
 | `release_model(lease_id)` | Release lease |
 | `force_stop_model(model_name)` | Stop a model regardless of leases; escape hatch for orphaned models |
@@ -202,10 +225,27 @@ Found 11 tools:
 | `list_leases()` | List current leases |
 | `list_profiles()` | List curated launch profiles |
 
+## How LLMs learn to use the server
+
+MCP clients only see what the server sends them: the tool list and the
+handshake instructions. This server puts its whole usage contract (workflow,
+lease rules, error recovery) in that handshake, so connected LLMs never need
+to read the source:
+
+- **Handshake instructions** — `SERVER_INSTRUCTIONS` in `mcp_server.py`,
+  sent in the initialize result and picked up by clients like Claude
+  Desktop/Code. Most clients feed this to the model at session start.
+- **`get_capabilities`** — echoes the same `SERVER_INSTRUCTIONS` text as a
+  `usage` field, the in-band fallback for clients that don't surface
+  handshake instructions.
+
+Keep `SERVER_INSTRUCTIONS` current when tools or semantics change; it is the
+only documentation a connected LLM is guaranteed to see.
+
 ## Safety Features
 
 - **Allowlist only**: Only approved tools exposed
-- **Lease-based lifecycle**: Models only stopped when all leases released
+- **Lease-based lifecycle**: Models only stopped when all leases released (after an idle grace period)
 - **Instance isolation**: Different presets and profiles = different instances
 - **Vetted flags only**: MCP clients never pass raw flags; only operator-defined profiles
 - **Atomic state writes**: State file updated safely
@@ -223,7 +263,7 @@ make clean   # Clean build artifacts
 
 ### Lease Model
 
-Models are "leased" when started via MCP. Workflows acquire leases via `acquire_model()` and release them with `release_model(lease_id)`. A model is only stopped when the last lease is released.
+Models are "leased" when started via MCP. Workflows acquire leases via `acquire_model()` and release them with `release_model(lease_id)`. A model is only stopped once the last lease is released and its idle grace period has lapsed, or earlier if another model needs its memory.
 
 ### State Schema
 
@@ -238,7 +278,8 @@ Models are "leased" when started via MCP. Workflows acquire leases via `acquire_
       "profile": "big-context",
       "managed_by_mcp": true,
       "started_at": "2024-01-01T10:00:00Z",
-      "port": 8080
+      "port": 8080,
+      "idle_since": null
     }
   ],
   "leases": [

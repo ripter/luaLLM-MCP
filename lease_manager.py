@@ -10,6 +10,14 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
 class SchemaVersion:
     V1 = "1.0"
 
@@ -40,7 +48,11 @@ class Instance:
     # (profiles.py). None means "no profile requested"; older state files
     # that predate profiles load with the default and keep matching.
     profile: str | None = None
-    
+    # ISO timestamp set when the last lease was released and the server was
+    # kept warm for the idle grace period; None while leased. Older state
+    # files load with the default.
+    idle_since: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
     
@@ -99,6 +111,12 @@ class LeaseManager:
     def _get_lease_ttl(self) -> int:
         """Get lease TTL in seconds from environment."""
         return int(os.environ.get("LUALLM_MCP_LEASE_TTL_SECONDS", "7200"))
+
+    def idle_grace_seconds(self) -> float:
+        """How long an MCP-managed model stays running after its last lease
+        is released, so a release → re-acquire cycle reuses the warm
+        server instead of a stop + cold start. 0 stops immediately."""
+        return max(0.0, float(os.environ.get("LUALLM_MCP_IDLE_GRACE_SECONDS", "300")))
     
     def _atomic_save(self, state: State) -> None:
         """Write state atomically using temp file + rename."""
@@ -197,9 +215,12 @@ class LeaseManager:
                 profile=profile,
             )
             self._state.instances.append(instance)
-        elif instance.port is None and port is not None:
-            # Backfill ports on records created before ports were tracked.
-            instance.port = port
+        else:
+            if instance.port is None and port is not None:
+                # Backfill ports on records created before ports were tracked.
+                instance.port = port
+            # A new lease ends any idle grace period.
+            instance.idle_since = None
 
         lease = Lease(
             lease_id=str(uuid.uuid4()),
@@ -243,8 +264,13 @@ class LeaseManager:
     def release_lease(self, lease_id: str, keep_instance: bool = False) -> dict[str, Any]:
         """Release a lease by ID.
 
-        keep_instance drops only the lease, never the instance record —
-        used when taking back a lease on a model that is still loading.
+        When the last lease on an MCP-managed instance goes, the instance
+        either stops now (idle grace 0 → record removed, instance_stopped
+        True; the caller stops the server) or is kept warm: idle_since is
+        stamped and the idle reaper stops it once the grace period lapses.
+        keep_instance never stops — used when taking back a lease on a
+        model that is still loading — but still marks the instance idle so
+        it is reaped if nobody comes back for it.
         """
         if self._state is None:
             self.load()
@@ -262,24 +288,66 @@ class LeaseManager:
                      if l.instance_id == lease.instance_id]
 
         should_stop = False
-        if instance and instance.managed_by_mcp and len(remaining) == 0 and not keep_instance:
-            should_stop = True
-
-        if should_stop:
-            self._state.instances = [i for i in self._state.instances
-                                   if i.instance_id != lease.instance_id]
+        idle = False
+        if instance and instance.managed_by_mcp and len(remaining) == 0:
+            if keep_instance or self.idle_grace_seconds() > 0:
+                instance.idle_since = _now_iso()
+                idle = True
+            else:
+                should_stop = True
+                self._state.instances = [i for i in self._state.instances
+                                         if i.instance_id != lease.instance_id]
 
         self.save()
 
-        return {
+        result = {
             "success": True,
             "instance_stopped": should_stop,
             "instance_id": lease.instance_id,
             "model": instance.model if instance else None,
             "remaining_leases": len(remaining),
             "external": bool(instance) and not instance.managed_by_mcp,
+            "idle": idle,
         }
-    
+        if idle:
+            result["idle_grace_s"] = self.idle_grace_seconds()
+        return result
+
+    def lease_count(self, instance_id: str) -> int:
+        if self._state is None:
+            self.load()
+        return sum(1 for l in self._state.leases if l.instance_id == instance_id)
+
+    def idle_instances(self) -> list[Instance]:
+        """MCP-managed instances with no leases, longest-idle first.
+
+        Any such instance is idle, even one never stamped (leases expired
+        by TTL, or a state file from before idle tracking): it gets stamped
+        now, so it receives a full grace period from first notice.
+        """
+        if self._state is None:
+            self.load()
+        leased = {l.instance_id for l in self._state.leases}
+        idle = [i for i in self._state.instances
+                if i.managed_by_mcp and i.instance_id not in leased]
+        stamped = False
+        for i in idle:
+            if i.idle_since is None:
+                i.idle_since = _now_iso()
+                stamped = True
+        if stamped:
+            self.save()
+        return sorted(idle, key=lambda i: _parse_iso(i.idle_since))
+
+    def expired_idle_instances(self, now: datetime | None = None) -> list[Instance]:
+        """Idle instances whose grace period has lapsed, longest-idle first.
+        Records are left in place; the caller stops each server and then
+        removes the record, so a failed stop is retried on the next sweep."""
+        now = now or datetime.now(timezone.utc)
+        grace = self.idle_grace_seconds()
+        return [i for i in self.idle_instances()
+                if (now - _parse_iso(i.idle_since)).total_seconds() >= grace]
+
     def renew_lease(self, lease_id: str) -> bool:
         """Renew a lease's timestamp."""
         if self._state is None:
