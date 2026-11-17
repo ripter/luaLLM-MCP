@@ -18,6 +18,8 @@ Environment:
   FAKE_LLAMA_TOKEN_DELAY       seconds between tokens (default 0)
   FAKE_LLAMA_REASONING_LEVELS  e.g. "low,medium,xhigh"; empty = no reasoning_effort
   FAKE_LLAMA_TEMPLATE          chat template text (default mentions enable_thinking)
+  FAKE_LLAMA_WORD              the word each token is made of (default "t")
+  FAKE_LLAMA_CRASH_AFTER       exit this many seconds after starting, while loading
 """
 
 import argparse
@@ -25,6 +27,7 @@ import json
 import os
 import select
 import socket
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -44,6 +47,8 @@ LEVELS = [l for l in os.environ.get("FAKE_LLAMA_REASONING_LEVELS", "low,medium,x
 TEMPLATE = os.environ.get(
     "FAKE_LLAMA_TEMPLATE",
     "{%- if enable_thinking is undefined or enable_thinking is true %}think{% endif %}")
+WORD = os.environ.get("FAKE_LLAMA_WORD", "t")
+CRASH_AFTER = os.environ.get("FAKE_LLAMA_CRASH_AFTER")
 EVENTS = Path(os.environ["FAKE_LUALLM_DIR"]) / f"{opts.model}.events"
 
 
@@ -113,6 +118,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "message": f"Unexpected reasoning effort {effort}"}})
             return
         model = f"/models/{opts.model}.gguf"
+        tokens = min(TOKENS, body.get("max_tokens") or TOKENS)
         if body.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -123,13 +129,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                 self.wfile.flush()
 
-            for n in range(TOKENS):
+            for n in range(tokens):
                 if client_gone(self.connection):
                     record({"event": "disconnected", "after": n})
                     self.close_connection = True
                     return
                 event = {"id": "c1", "object": "chat.completion.chunk", "model": model,
-                         "choices": [{"index": 0, "delta": {"content": f"t{n} "},
+                         "choices": [{"index": 0, "delta": {"content": f"{WORD}{n} "},
                                       "finish_reason": None}]}
                 try:
                     chunk(b"data: " + json.dumps(event).encode() + b"\n\n")
@@ -140,35 +146,37 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(TOKEN_DELAY)
             final = {"id": "c1", "object": "chat.completion.chunk", "model": model,
                      "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                     "usage": {"prompt_tokens": 3, "completion_tokens": TOKENS,
-                               "total_tokens": 3 + TOKENS}}
+                     "usage": {"prompt_tokens": 3, "completion_tokens": tokens,
+                               "total_tokens": 3 + tokens}}
             try:
                 chunk(b"data: " + json.dumps(final).encode() + b"\n\n")
                 chunk(b"data: [DONE]\n\n")
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except OSError:
-                record({"event": "disconnected", "after": TOKENS})
+                record({"event": "disconnected", "after": tokens})
                 return
-            record({"event": "completed", "tokens": TOKENS})
+            record({"event": "completed", "tokens": tokens})
             return
 
-        for n in range(TOKENS):
+        for n in range(tokens):
             if client_gone(self.connection):
                 record({"event": "disconnected", "after": n})
                 self.close_connection = True
                 return
             time.sleep(TOKEN_DELAY)
-        record({"event": "completed", "tokens": TOKENS})
+        record({"event": "completed", "tokens": tokens})
         self._json(200, {
             "id": "c1", "object": "chat.completion", "model": model,
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant",
-                                     "content": " ".join(f"t{n}" for n in range(TOKENS))}}],
-            "usage": {"prompt_tokens": 3, "completion_tokens": TOKENS,
-                      "total_tokens": 3 + TOKENS},
+                                     "content": " ".join(f"{WORD}{n}" for n in range(tokens))}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": tokens,
+                      "total_tokens": 3 + tokens},
         })
 
 
+if CRASH_AFTER:
+    threading.Timer(float(CRASH_AFTER), lambda: os._exit(1)).start()
 ThreadingHTTPServer.daemon_threads = True
 ThreadingHTTPServer(("127.0.0.1", opts.port), Handler).serve_forever()

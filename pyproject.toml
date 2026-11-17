@@ -5,6 +5,10 @@ description = "MCP Server for luaLLM - safe model management via leases"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0",
+    # The OpenAI gateway (gateway.py). Both also come with mcp; named here
+    # because the gateway uses them directly.
+    "httpx>=0.28",
+    "uvicorn>=0.30",
 ]
 
 [build-system]
