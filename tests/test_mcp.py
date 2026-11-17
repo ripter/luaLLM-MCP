@@ -466,7 +466,8 @@ def test_acquire_refuses_when_model_runs_under_other_config(monkeypatch, tmp_pat
     assert "MODEL_RUNNING_DIFFERENT_CONFIG" in result["error"]
     assert "vision" in result["error"]
     # The other record and its server are untouched by the refusal.
-    assert mcp_server.lease_manager.find_instance_for_model("tiny") is recorded
+    assert (mcp_server.lease_manager.find_instance_for_model("tiny").instance_id
+            == recorded.instance_id)
 
 
 def test_acquire_with_profile_applies_preset_and_args(monkeypatch, tmp_path):
@@ -893,11 +894,13 @@ def test_expired_leases_leave_instance_idle_for_reaping(monkeypatch, tmp_path):
     manager = lease_manager.LeaseManager(state_dir=str(tmp_path))
     instance, lease = manager.acquire_lease("tiny", None)
     manager._state.leases = []  # as if expire_stale_leases dropped it
+    manager.save()
     assert instance.idle_since is None
 
     idle = manager.idle_instances()
     assert [i.instance_id for i in idle] == [instance.instance_id]
-    assert instance.idle_since is not None
+    assert idle[0].idle_since is not None
+    assert manager.find_instance("tiny").idle_since == idle[0].idle_since
     assert manager.expired_idle_instances() == []
 
 
