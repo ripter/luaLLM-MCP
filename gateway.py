@@ -573,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=argparse.SUPPRESS)
     opts = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # httpx logs every upstream URL at INFO; this gateway logs each request once.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     state_dir = get_state_dir()
 
     if opts.init_token:
