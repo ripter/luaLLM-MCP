@@ -41,9 +41,11 @@ class FakeLuaLLM:
         return json.loads(p.read_text()) if p.exists() else []
 
     def cleanup(self) -> None:
-        for s in self.servers():
+        # pids.log, not servers.json: a duplicate start (the race some tests
+        # look for) replaces its predecessor's entry in servers.json.
+        for pid in {int(p) for p in self.lines("pids.log")}:
             try:
-                os.kill(s["pid"], signal.SIGKILL)
+                os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
 

@@ -113,6 +113,7 @@ def main(argv: list[str]) -> int:
             [sys.executable, str(HERE / "fake_llama_server.py"), "--port", str(port),
              "--model", model, *extra],
             stdout=log, stderr=log, start_new_session=True)
+        _log("pids.log", str(proc.pid))  # every server ever started, for cleanup
         servers = [s for s in _servers() if s["model"] != model]
         servers.append({"model": model, "pid": proc.pid, "port": port,
                         "state": "running", "mode": "daemon", "args": extra})
