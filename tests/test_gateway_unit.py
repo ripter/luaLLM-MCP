@@ -53,6 +53,26 @@ def test_config_skips_broken_entries_and_says_why(tmp_path):
         assert fragment in text
 
 
+def test_config_default_model_names_a_served_model(tmp_path):
+    _write(tmp_path, {"models": {"qwen": {"model": "Q"}}}, {})
+    assert _load(tmp_path).default_model is None
+
+    _write(tmp_path, {"default_model": "qwen", "models": {"qwen": {"model": "Q"}}}, {})
+    config = _load(tmp_path)
+    assert config.default_model == "qwen" and config.warnings == []
+
+    # A default whose entry is broken, or missing, is no default: never another model instead.
+    _write(tmp_path, {"default_model": "eyes", "models": {
+        "qwen": {"model": "Q"}, "eyes": {"model": "Q", "profile": "missing"}}}, {})
+    config = _load(tmp_path)
+    assert config.default_model is None
+    assert any("default_model 'eyes'" in w for w in config.warnings)
+
+    _write(tmp_path, {"default_model": 3, "models": {}}, {})
+    with pytest.raises(ConfigError, match="default_model"):
+        _load(tmp_path)
+
+
 def test_config_refuses_non_loopback_unless_asked(tmp_path):
     _write(tmp_path, {"listen": "0.0.0.0:8090", "models": {}})
     with pytest.raises(ConfigError, match="isn't loopback"):

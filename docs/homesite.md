@@ -36,6 +36,7 @@ on the Mac. Keep it where Home Site keeps the engine's provider key today
     "object": "model",
     "owned_by": "luallm",
     "description": "General assistant",
+    "default": true,
     "loaded": true,
     "capabilities": {
       "images": true,
@@ -56,6 +57,11 @@ on the Mac. Keep it where Home Site keeps the engine's provider key today
 `id` is what Home Site stores as the model and sends as `model`. The owner
 chooses the names in `gateway.json`; Home Site never sees model files, presets,
 or flags.
+
+`default` marks the one `default_model` in `gateway.json` names, at most one.
+Home Site's applications choose a model for each request, from the list and
+each one's `description`, and use this one when they don't. With no default, a
+request that doesn't choose is refused rather than sent to another.
 
 `capabilities` is what that model's own llama-server reported the last time it
 loaded (**verified** for the owner's Qwen3.8 and Maginum). It is `null` until
