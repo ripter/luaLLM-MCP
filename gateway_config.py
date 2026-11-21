@@ -5,6 +5,7 @@ gateway.json (in the state dir, next to profiles.json):
 
     {
       "listen": "127.0.0.1:8090",
+      "default_model": "qwen",
       "models": {
         "qwen": {"model": "Qwen3.8-27B-Uncensored-Q6_K", "profile": "director",
                  "max_output_tokens": 4096, "description": "..."}
@@ -16,6 +17,10 @@ model files, presets, or flags behind them. The file and profiles.json are
 read again for each request, so edits apply to the next request; a request
 already running keeps the route it started with. "listen" is read once, at
 startup.
+
+"default_model" names the one clients should use when they have no reason
+to choose. The gateway itself never routes to it: /v1/models marks it, and
+a chat request still names its model.
 """
 
 import hashlib
@@ -36,7 +41,7 @@ DEFAULT_LISTEN = "127.0.0.1:8090"
 DEFAULT_MAX_REQUEST_MB = 32
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _ROUTE_KEYS = {"model", "profile", "max_output_tokens", "description"}
-_TOP_KEYS = {"listen", "allow_non_loopback", "max_request_mb", "models"}
+_TOP_KEYS = {"listen", "allow_non_loopback", "max_request_mb", "models", "default_model"}
 TOKEN_FILE = "gateway.token"
 MIN_TOKEN_LENGTH = 32
 
@@ -88,6 +93,8 @@ class GatewayConfig:
     max_request_bytes: int
     routes: dict[str, Route]
     warnings: list[str]
+    # A name in routes, or None: unset, or naming one that isn't served.
+    default_model: str | None = None
 
 
 def _parse_listen(value: Any, allow_non_loopback: bool) -> tuple[str, int]:
@@ -179,8 +186,18 @@ def load_config(state_dir: str | Path, profiles: ProfileRegistry) -> GatewayConf
         routes[name] = Route(name=name, model=model, profile=profile,
                              max_output_tokens=max_out, description=description)
 
+    default = data.get("default_model")
+    if default is not None and not isinstance(default, str):
+        raise ConfigError("'default_model' must be the name of one of 'models'")
+    if default is not None and default not in routes:
+        # Warned, not refused, like a broken entry: its own entry may be the broken one, and the
+        # other models still work. Clients are told there's no default rather than given another.
+        warnings.append(f"default_model '{default}' isn't one of the models served, so there's "
+                        f"no default")
+        default = None
+
     return GatewayConfig(host=host, port=port, max_request_bytes=int(max_mb * 1024 * 1024),
-                         routes=routes, warnings=warnings)
+                         routes=routes, warnings=warnings, default_model=default)
 
 
 def load_token(state_dir: str | Path) -> str:

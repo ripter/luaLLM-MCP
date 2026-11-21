@@ -196,6 +196,7 @@ or profiles.
 ```json
 {
   "listen": "127.0.0.1:8090",
+  "default_model": "qwen",
   "models": {
     "qwen":   { "model": "Qwen3.8-27B-Uncensored-Q6_K", "profile": "director",
                 "max_output_tokens": 4096, "description": "General assistant" },
@@ -210,7 +211,8 @@ or profiles.
 | `model` | yes | A luallm model name (`luallm list`). Clients never see it |
 | `profile` | no | A profile from `profiles.json`. Its flags are applied when the gateway starts the model |
 | `max_output_tokens` | no | Longest reply allowed, and the default when a request doesn't say |
-| `description` | no | Shown in `/v1/models` |
+| `description` | no | Shown in `/v1/models`. Say what the model is good for: clients show it to people choosing one |
+| `default_model` | no | The name clients should use when they have no reason to choose. `/v1/models` marks it `"default": true`. Requests still name their model. One that isn't served, or whose entry is broken, is warned about and means no default |
 | `listen` | no | `host:port`, default `127.0.0.1:8090`. Loopback only unless you also set `"allow_non_loopback": true` |
 | `max_request_mb` | no | Largest request body, default 32 |
 

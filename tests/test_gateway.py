@@ -50,9 +50,9 @@ class GatewayProc:
         self.log = tmp_path / "gateway.log"
         self.proc = None
 
-    def write_config(self, models: dict) -> None:
+    def write_config(self, models: dict, **extra) -> None:
         (self.state / "gateway.json").write_text(json.dumps(
-            {"listen": f"127.0.0.1:{self.port}", "models": models}))
+            {"listen": f"127.0.0.1:{self.port}", "models": models, **extra}))
 
     def write_profiles(self, profiles: dict) -> None:
         (self.state / "profiles.json").write_text(json.dumps({"profiles": profiles}))
@@ -227,6 +227,15 @@ def test_models_lists_names_and_verified_capabilities(gateway):
     assert caps["reasoning"]["effort_levels"] == ["low", "medium", "xhigh"]
     assert after["eyes"]["loaded"] is True
     assert after["tiny"]["loaded"] is False  # same model, other configuration
+    assert not any(m["default"] for m in after.values())
+
+
+def test_models_marks_the_default_and_reads_it_again(gateway):
+    g = gateway({"tiny": {"model": "tiny"}, "other": {"model": "tiny"}})
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    g.write_config({"tiny": {"model": "tiny"}, "other": {"model": "tiny"}}, default_model="other")
+    listed = {m["id"]: m["default"] for m in httpx.get(g.url("/v1/models"), headers=auth).json()["data"]}
+    assert listed == {"tiny": False, "other": True}
 
 
 # -- capabilities enforced against the model's own server --

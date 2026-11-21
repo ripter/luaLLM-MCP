@@ -228,6 +228,7 @@ class Gateway:
                 "created": 0,
                 "owned_by": "luallm",
                 "description": route.description,
+                "default": route.name == config.default_model,
                 "loaded": self._loaded(route, running, state),
                 "capabilities": entry["capabilities"] if entry else None,
                 "capabilities_verified_at": entry["verified_at"] if entry else None,
@@ -594,7 +595,8 @@ def main(argv: list[str] | None = None) -> int:
     if opts.check:
         print(f"listen: {config.host}:{config.port}")
         for r in config.routes.values():
-            print(f"  {r.name}: {r.model}" + (f" (profile {r.profile.name})" if r.profile else ""))
+            print(f"  {r.name}: {r.model}" + (f" (profile {r.profile.name})" if r.profile else "")
+                  + (" (default)" if r.name == config.default_model else ""))
         if not config.routes:
             print("  no models are exposed")
         return 0
